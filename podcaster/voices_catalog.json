@@ -1,0 +1,146 @@
+[
+  {
+    "id": "English_Trustworthy_Man",
+    "label": "Trustworthy Man",
+    "gender": "male",
+    "tone": "trustworthy, warm, narrator",
+    "native": "en",
+    "verified": true
+  },
+  {
+    "id": "English_Upbeat_Woman",
+    "label": "Upbeat Woman",
+    "gender": "female",
+    "tone": "bright, energetic, host",
+    "native": "en",
+    "verified": true
+  },
+  {
+    "id": "presenter_male",
+    "label": "Presenter Man",
+    "gender": "male",
+    "tone": "professional, anchor",
+    "native": "en",
+    "verified": true
+  },
+  {
+    "id": "presenter_female",
+    "label": "Presenter Woman",
+    "gender": "female",
+    "tone": "professional, anchor",
+    "native": "en",
+    "verified": true
+  },
+  {
+    "id": "audiobook_male_1",
+    "label": "Audiobook Man",
+    "gender": "male",
+    "tone": "measured, documentary",
+    "native": "en",
+    "verified": true
+  },
+  {
+    "id": "audiobook_female_1",
+    "label": "Audiobook Woman",
+    "gender": "female",
+    "tone": "measured, documentary",
+    "native": "en",
+    "verified": true
+  },
+  {
+    "id": "male-qn-qingse",
+    "label": "青涩青年 / Youthful Man",
+    "gender": "male",
+    "tone": "youthful, sincere",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "male-qn-jingying",
+    "label": "精英青年 / Elite Young Man",
+    "gender": "male",
+    "tone": "confident, sharp",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "male-qn-badao",
+    "label": "霸道青年 / Commanding Man",
+    "gender": "male",
+    "tone": "decisive, magnetic",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "male-qn-daxuesheng",
+    "label": "青年大学生 / Student Man",
+    "gender": "male",
+    "tone": "casual, friendly",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "female-shaonv",
+    "label": "少女 / Young Woman",
+    "gender": "female",
+    "tone": "light, friendly",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "female-yujie",
+    "label": "御姐 / Confident Woman",
+    "gender": "female",
+    "tone": "mature, assured",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "female-tianmei",
+    "label": "甜美 / Sweet Woman",
+    "gender": "female",
+    "tone": "warm, sweet",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "female-chengshu",
+    "label": "成熟女性 / Mature Woman",
+    "gender": "female",
+    "tone": "mature, composed",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "Chinese (Mandarin)_News_Anchor",
+    "label": "新闻主播 / News Anchor",
+    "gender": "male",
+    "tone": "news, formal",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "Chinese (Mandarin)_Warm_Bestie",
+    "label": "暖心好友 / Warm Bestie",
+    "gender": "female",
+    "tone": "warm, friendly",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "Chinese (Mandarin)_Wise_Women",
+    "label": "知性女声 / Wise Woman",
+    "gender": "female",
+    "tone": "thoughtful, wise",
+    "native": "zh",
+    "verified": true
+  },
+  {
+    "id": "Chinese (Mandarin)_Lyrical_Voice",
+    "label": "抒情女声 / Lyrical Voice",
+    "gender": "female",
+    "tone": "poetic, gentle",
+    "native": "zh",
+    "verified": true
+  }
+]

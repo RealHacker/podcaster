@@ -1,0 +1,37 @@
+# --- Secrets and local settings -------------------------------------------
+# env.ps1 holds your MiniMax API key — never commit it.
+env.ps1
+
+# data/ holds config.json (API keys), uploaded documents and job workdirs.
+data/
+
+# --- Generated media --------------------------------------------------------
+# Everything the tool produces lands here.
+output/
+
+# --- Runtime logs -----------------------------------------------------------
+*.log
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editors and OS ---------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+.DS_Store
+desktop.ini

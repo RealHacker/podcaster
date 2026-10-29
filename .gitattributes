@@ -1,0 +1,17 @@
+# Normalise text in the repository; check out with the platform's endings.
+* text=auto
+
+# The PowerShell launcher is run on Windows.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.mp3 binary
+*.mp4 binary
+*.pdf binary

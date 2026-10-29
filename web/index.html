@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Podcaster</title>
+<link rel="stylesheet" href="/static/style.css?v=6" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>" />
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🎙️</span>
+      <div>
+        <h1>Podcaster</h1>
+        <p class="tagline">Documents in. Podcasts out.</p>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-view="compose">Compose</button>
+      <button class="tab" data-view="jobs">Jobs <span class="badge" id="jobBadge" hidden>0</span></button>
+      <button class="tab" data-view="settings">Settings</button>
+    </nav>
+    <div class="health" id="healthPill"><span class="dot"></span><span id="healthText">checking…</span></div>
+  </header>
+
+  <!-- ================= COMPOSE ================= -->
+  <main class="view active" id="view-compose">
+    <div class="grid">
+      <!-- LEFT COLUMN -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>1 · Source material</h2>
+        </div>
+        <div class="panel-body">
+          <div class="seg-control" id="sourceType">
+            <button class="seg active" data-type="url">Web link</button>
+            <button class="seg" data-type="upload">Upload file</button>
+            <button class="seg" data-type="text">Paste text</button>
+          </div>
+
+          <div class="src-pane active" data-pane="url">
+            <label class="field">
+              <span>URL</span>
+              <input type="url" id="sourceUrl" placeholder="https://example.com/article" />
+            </label>
+          </div>
+
+          <div class="src-pane" data-pane="upload">
+            <label class="field">
+              <span>Document</span>
+              <div class="dropzone" id="dropzone">
+                <input type="file" id="sourceFile" accept=".pdf,.md,.markdown,.txt,.html,.htm,.docx" hidden />
+                <div class="dz-inner">
+                  <div class="dz-icon">📄</div>
+                  <p id="dzLabel">Drop a file here or <strong>browse</strong></p>
+                  <small>PDF · Markdown · TXT · HTML · DOCX (max 60&nbsp;MB)</small>
+                </div>
+              </div>
+            </label>
+            <div class="field">
+              <span>Or a file already on this computer</span>
+              <div class="path-row">
+                <input type="text" id="sourcePath" placeholder="E:\docs\paper.pdf" />
+                <button class="btn ghost" id="browseSource">Browse…</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="src-pane" data-pane="text">
+            <label class="field">
+              <span>Text</span>
+              <textarea id="sourceText" rows="9" placeholder="Paste the article, notes or transcript here…"></textarea>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- MIDDLE COLUMN -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>2 · Podcast setup</h2>
+        </div>
+        <div class="panel-body">
+          <label class="field">
+            <span>Episode title <em class="hint">optional</em></span>
+            <input type="text" id="podTitle" placeholder="Leave blank to derive from the source" />
+          </label>
+
+          <div class="row-2">
+            <label class="field">
+              <span>Language</span>
+              <select id="language">
+                <option value="en">English</option>
+                <option value="zh">中文 (Chinese)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Style</span>
+              <select id="style"></select>
+            </label>
+          </div>
+          <p class="style-desc" id="styleDesc"></p>
+
+          <label class="field">
+            <span>Target length</span>
+            <div class="range-row">
+              <input type="range" id="lengthRange" min="1" max="45" step="1" value="6" />
+              <output id="lengthOut">6 min</output>
+            </div>
+            <small class="hint">Roughly — the writer aims near this and the readout tells you what you got.</small>
+          </label>
+
+          <div class="field">
+            <span>Hosts</span>
+            <div class="hosts" id="hosts"></div>
+            <div class="hosts-actions">
+              <button class="btn ghost sm" id="addHost">+ Add host</button>
+              <button class="btn ghost sm" id="resetHosts">Reset</button>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Extra instructions <em class="hint">optional</em></span>
+            <textarea id="extraInstructions" rows="3" placeholder="e.g. Keep it optimistic and end with a call to action."></textarea>
+          </label>
+        </div>
+      </section>
+
+      <!-- RIGHT COLUMN -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>3 · Export</h2>
+        </div>
+        <div class="panel-body">
+          <div class="field">
+            <span>Format</span>
+            <div class="seg-control" id="exportFormat">
+              <button class="seg active" data-fmt="audio">🎧 Audio</button>
+              <button class="seg" data-fmt="video">🎬 Video</button>
+            </div>
+          </div>
+
+          <label class="field inline" id="slideOption" hidden>
+            <input type="checkbox" id="showSlides" />
+            <span>Illustrated slides <em class="hint">AI images, one per point</em></span>
+          </label>
+
+          <label class="field inline" id="subtitleOption" hidden>
+            <input type="checkbox" id="showSubtitles" />
+            <span>Show subtitles on the video</span>
+          </label>
+
+          <label class="field">
+            <span>Output file path</span>
+            <div class="path-row">
+              <input type="text" id="exportPath" placeholder="Auto-generated in the output folder" />
+              <button class="btn ghost" id="browseExport">Browse…</button>
+            </div>
+            <small class="hint" id="exportHint"></small>
+          </label>
+
+          <div class="row-2">
+            <label class="field">
+              <span>Speech speed</span>
+              <select id="ttsSpeed">
+                <option value="0.9">0.9× — slow</option>
+                <option value="1.0" selected>1.0× — natural</option>
+                <option value="1.1">1.1× — brisk</option>
+                <option value="1.2">1.2× — fast</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Pause between turns</span>
+              <select id="gapSeconds">
+                <option value="0.15">0.15 s</option>
+                <option value="0.28" selected>0.28 s</option>
+                <option value="0.45">0.45 s</option>
+                <option value="0.7">0.70 s</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="launch">
+            <button class="btn primary big" id="generateBtn">Generate podcast</button>
+            <button class="btn ghost" id="cancelBtn" hidden>Cancel</button>
+          </div>
+          <p class="launch-note" id="launchNote">Nothing runs until you press the button.</p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- ================= JOBS ================= -->
+  <main class="view" id="view-jobs">
+    <div class="jobs-layout">
+      <section class="panel slim">
+        <div class="panel-head">
+          <h2>Jobs</h2>
+          <button class="btn ghost sm" id="refreshJobs">Refresh</button>
+        </div>
+        <div class="panel-body no-pad">
+          <ul class="job-list" id="jobList"></ul>
+        </div>
+      </section>
+      <section class="panel" id="jobDetail">
+        <div class="panel-body empty-state" id="jobEmpty">
+          <div class="empty-icon">🗂️</div>
+          <p>Select a job to see its progress, logs and results.</p>
+        </div>
+        <div class="panel-body" id="jobDetailBody" hidden>
+          <div class="job-head">
+            <div>
+              <h2 id="jdTitle">—</h2>
+              <p class="muted" id="jdMeta">—</p>
+            </div>
+            <span class="status-pill" id="jdStatus">—</span>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress"><div class="progress-fill" id="jdProgress"></div></div>
+            <span class="progress-label" id="jdStep">—</span>
+          </div>
+          <div class="jd-actions" id="jdActions"></div>
+          <div class="jd-body">
+            <div class="jd-logs">
+              <h3>Activity</h3>
+              <div class="logbox" id="jdLogs"></div>
+            </div>
+            <div class="jd-script">
+              <h3>Script</h3>
+              <div class="scriptbox" id="jdScript"><p class="muted">Not available yet.</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- ================= SETTINGS ================= -->
+  <main class="view" id="view-settings">
+    <div class="settings-layout">
+      <section class="panel">
+        <div class="panel-head"><h2>Language model</h2></div>
+        <div class="panel-body">
+          <p class="muted small">Any OpenAI-compatible chat endpoint.</p>
+          <label class="field">
+            <span>Base URL</span>
+            <input type="text" id="llmBaseUrl" placeholder="https://api.minimaxi.com/v1" />
+          </label>
+          <div class="row-2">
+            <label class="field">
+              <span>Model</span>
+              <input type="text" id="llmModel" list="llmModelList" placeholder="MiniMax-M2.5" />
+              <datalist id="llmModelList"></datalist>
+            </label>
+            <label class="field">
+              <span>API key</span>
+              <input type="password" id="llmApiKey" placeholder="sk-…" autocomplete="off" />
+            </label>
+          </div>
+          <div class="row-2">
+            <label class="field">
+              <span>Temperature</span>
+              <input type="number" id="llmTemperature" min="0" max="1.5" step="0.1" />
+            </label>
+            <label class="field">
+              <span>Max tokens</span>
+              <input type="number" id="llmMaxTokens" min="512" max="32000" step="256" />
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Text to speech</h2></div>
+        <div class="panel-body">
+          <label class="field">
+            <span>Provider</span>
+            <select id="ttsProvider">
+              <option value="minimax">MiniMax T2A v2</option>
+              <option value="openai">OpenAI-compatible /audio/speech</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Endpoint</span>
+            <input type="text" id="ttsBaseUrl" placeholder="https://api.minimaxi.com/v1" />
+          </label>
+          <div class="row-2">
+            <label class="field">
+              <span>Model</span>
+              <input type="text" id="ttsModel" list="ttsModelList" placeholder="speech-2.5-hd-preview" />
+              <datalist id="ttsModelList">
+                <option value="speech-2.5-hd-preview"></option>
+                <option value="speech-02-hd"></option>
+                <option value="speech-02-turbo"></option>
+                <option value="speech-2.8-hd"></option>
+              </datalist>
+            </label>
+            <label class="field">
+              <span>API key</span>
+              <input type="password" id="ttsApiKey" placeholder="sk-…" autocomplete="off" />
+            </label>
+          </div>
+          <label class="field">
+            <span>Default output folder</span>
+            <input type="text" id="outputDir" />
+          </label>
+          <hr />
+          <h3 class="sub">Images</h3>
+          <p class="muted small">Used for the illustrated slides of a video export. Uses the
+            API key above unless you set a different one.</p>
+          <div class="row-2">
+            <label class="field">
+              <span>Endpoint</span>
+              <input type="text" id="imageBaseUrl" placeholder="Same as the TTS endpoint" />
+            </label>
+            <label class="field">
+              <span>Model</span>
+              <input type="text" id="imageModel" list="imageModelList" placeholder="image-01" />
+              <datalist id="imageModelList">
+                <option value="image-01"></option>
+                <option value="image-01-live"></option>
+              </datalist>
+            </label>
+          </div>
+          <label class="field">
+            <span>API key</span>
+            <input type="password" id="imageApiKey" placeholder="sk-…" autocomplete="off" />
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Diagnostics</h2></div>
+        <div class="panel-body">
+          <button class="btn" id="testBtn">Test connections</button>
+          <div id="testResults" class="test-results"></div>
+          <hr />
+          <h3 class="sub">Voice catalogue</h3>
+          <p class="muted small" id="voiceCount">—</p>
+          <div class="voice-verify">
+            <input type="text" id="verifyVoiceId" placeholder="voice_id to test (e.g. male-qn-qingse)" />
+            <button class="btn ghost" id="verifyVoiceBtn">Test voice</button>
+          </div>
+          <div id="voiceVerifyResult" class="test-results"></div>
+        </div>
+      </section>
+    </div>
+    <div class="save-bar">
+      <span class="muted" id="saveStatus">Changes are not saved yet.</span>
+      <button class="btn primary" id="saveSettings">Save settings</button>
+    </div>
+  </main>
+</div>
+
+<!-- File browser modal -->
+<div class="modal-backdrop" id="browserModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="browserTitle">Choose a folder</h3>
+      <button class="icon-btn" id="browserClose">✕</button>
+    </div>
+    <div class="modal-path" id="browserPath"></div>
+    <ul class="browser-list" id="browserList"></ul>
+    <div class="modal-foot">
+      <label class="field inline">
+        <span>Path</span>
+        <input type="text" id="browserInput" />
+      </label>
+      <div class="modal-buttons">
+        <button class="btn ghost" id="browserCancel">Cancel</button>
+        <button class="btn primary" id="browserPick">Use this path</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="/static/app.js?v=4"></script>
+</body>
+</html>
