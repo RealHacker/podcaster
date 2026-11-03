@@ -139,8 +139,9 @@ test_split_for_qwen()
 print("split_for_qwen:", "PASS" if not fails else f"FAIL {fails}")
 
 
-# --- JSON+URL response handling (mocked) ---
+# --- JSON+URL response handling (mocked) - WAV output when caller wants WAV ---
 def test_json_url_response():
+    """When caller requests .wav and API returns WAV, no conversion needed."""
     global fails
 
     qwen_tts = OpenAICompatTTS(
@@ -165,7 +166,7 @@ def test_json_url_response():
     mock_audio_response.raise_for_status = MagicMock()
 
     with tempfile.TemporaryDirectory() as tmp:
-        out_path = Path(tmp) / "test.mp3"
+        out_path = Path(tmp) / "test.wav"
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -180,8 +181,8 @@ def test_json_url_response():
                 fails.append(f"Expected wav format, got {result.format}")
             if not result.path.exists():
                 fails.append("Output file should exist")
-            if result.path.suffix != ".wav":
-                fails.append(f"Expected .wav suffix, got {result.path.suffix}")
+            if result.path != out_path:
+                fails.append(f"Expected path {out_path}, got {result.path}")
 
 
 test_json_url_response()
@@ -268,6 +269,113 @@ def test_missing_audio_url():
 test_missing_audio_url()
 print("missing_audio_url:", "PASS" if not fails else f"FAIL {fails}")
 
+
+# --- WAV to MP3 conversion - file exists at requested path ---
+def test_wav_to_mp3_conversion_at_requested_path():
+    """Qwen returns WAV but caller wants MP3 - file should exist at requested .mp3 path."""
+    global fails
+
+    qwen_tts = OpenAICompatTTS(
+        base_url="https://api.modelverse.cn/v1",
+        api_key="test-key",
+        model="qwen3-tts-flash",
+    )
+
+    mock_json_response = MagicMock()
+    mock_json_response.headers = {"content-type": "application/json"}
+    mock_json_response.json.return_value = {
+        "output": {
+            "audio": {
+                "url": "https://example.com/audio.wav"
+            }
+        }
+    }
+
+    wav_header = (
+        b"RIFF" + b"\x24\x00\x00\x00" +
+        b"WAVE" +
+        b"fmt " + b"\x10\x00\x00\x00" +
+        b"\x01\x00\x01\x00" +
+        b"\x44\xac\x00\x00" +
+        b"\x88\x58\x01\x00" +
+        b"\x02\x00\x10\x00" +
+        b"data" + b"\x00\x00\x00\x00"
+    )
+    mock_audio_response = MagicMock()
+    mock_audio_response.content = wav_header + b"\x00" * 100
+    mock_audio_response.headers = {"content-type": "audio/wav"}
+    mock_audio_response.raise_for_status = MagicMock()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        requested_path = Path(tmp) / "probe.mp3"
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.get.return_value = mock_audio_response
+            mock_client_cls.return_value = mock_client
+
+            result = qwen_tts._handle_response(
+                mock_json_response, requested_path, source_text="Test voice"
+            )
+
+            if not requested_path.exists():
+                fails.append(
+                    f"File should exist at requested path {requested_path}, "
+                    f"but result.path is {result.path}"
+                )
+
+            if result.path != requested_path:
+                fails.append(
+                    f"result.path should be {requested_path}, got {result.path}"
+                )
+
+            if result.chars != len("Test voice"):
+                fails.append(
+                    f"result.chars should be text length (10), got {result.chars}"
+                )
+
+            if result.format != "mp3":
+                fails.append(f"result.format should be 'mp3', got {result.format}")
+
+
+test_wav_to_mp3_conversion_at_requested_path()
+print("wav_to_mp3_conversion:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- chars should be text length, not audio bytes ---
+def test_chars_is_text_length():
+    """ClipResult.chars should reflect input text length, not audio byte count."""
+    global fails
+
+    openai_tts = OpenAICompatTTS(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="tts-1",
+    )
+
+    mock_response = MagicMock()
+    mock_response.headers = {"content-type": "audio/mpeg"}
+    mock_response.content = b"\xff\xfb\x90\x00" + b"\x00" * 5000
+
+    test_text = "Hello, this is a test."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "test.mp3"
+        result = openai_tts._handle_response(
+            mock_response, out_path, source_text=test_text
+        )
+
+        if result.chars != len(test_text):
+            fails.append(
+                f"chars should be text length ({len(test_text)}), "
+                f"got {result.chars}"
+            )
+
+
+test_chars_is_text_length()
+print("chars_is_text_length:", "PASS" if not fails else f"FAIL {fails}")
 
 print()
 if fails:
