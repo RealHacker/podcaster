@@ -24,7 +24,7 @@ from .chunking import split_into_chunks
 from .llm import LLMClient
 from .script import Host, Script, Turn, generate_script, parse_turns
 from .sources import SourceDoc, fetch_url, load_local_file
-from .tts import build_tts, split_for_tts
+from .tts import build_tts, is_qwen_dialect, split_for_tts
 
 if TYPE_CHECKING:
     from .jobs import Job
@@ -83,7 +83,12 @@ def _slugify(text: str, fallback: str = "podcast") -> str:
     return slug[:80] or fallback
 
 
-def build_hosts(req: PodcastRequest) -> list[Host]:
+def build_hosts(req: PodcastRequest, cfg: dict[str, Any] | None = None) -> list[Host]:
+    """Build host list with assigned voices.
+
+    When ``cfg`` is provided and indicates Qwen TTS dialect, Qwen-compatible
+    voices (Cherry, Ethan, etc.) are assigned instead of MiniMax voices.
+    """
     count = max(1, min(6, int(req.host_count or 2)))
     genders: list[str] = []
     for i in range(count):
@@ -120,7 +125,13 @@ def build_hosts(req: PodcastRequest) -> list[Host]:
 
         hosts.append(Host(name=name, gender=gender, persona=persona))
 
-    voices_mod.assign_voices(hosts, req.language, req.voice_overrides)
+    is_qwen = False
+    if cfg:
+        is_qwen = is_qwen_dialect(
+            cfg.get("tts_model", ""),
+            cfg.get("tts_base_url", "")
+        )
+    voices_mod.assign_voices(hosts, req.language, req.voice_overrides, is_qwen=is_qwen)
     return hosts
 
 
@@ -367,7 +378,7 @@ def run_pipeline(
 
     # ---- 3. Script -------------------------------------------------------- #
     on_step("Writing the podcast script", 0.1)
-    hosts = build_hosts(req)
+    hosts = build_hosts(req, cfg)
     log("info", "Casting: " + ", ".join(f"{h.name} ({h.gender}) → {h.voice_id}" for h in hosts))
 
     client = LLMClient(
@@ -434,7 +445,7 @@ def run_pipeline(
     clips: list[Path] = []
     clip_records: list[dict[str, Any]] = []
     voice_by_name = {h.name: h for h in hosts}
-    max_chars = 4800 if "2.8" in (cfg.get("tts_model") or "") else 4000
+    max_chars = getattr(tts, "max_chars", lambda: 4000)()
     total = len(script.turns)
     want_subtitles = req.export_format == "video" and bool(req.show_subtitles)
 

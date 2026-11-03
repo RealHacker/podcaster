@@ -5,6 +5,7 @@ Covers:
 - Payload shape (no speed/response_format for Qwen)
 - JSON+URL response handling
 - Character limit (600 chars for Qwen)
+- Qwen voice assignment and listing
 """
 import json
 import sys
@@ -20,7 +21,16 @@ from podcaster.tts import (
     is_qwen_dialect,
     split_for_tts,
 )
-from podcaster.voices import get_default_qwen_voice, get_qwen_voices
+from podcaster.voices import (
+    assign_voices,
+    get_default_qwen_voice,
+    get_qwen_voices,
+    list_voices,
+    load_catalog,
+    QWEN_VOICES,
+)
+from podcaster.pipeline import build_hosts, PodcastRequest
+from podcaster.script import Host
 
 fails = []
 
@@ -376,6 +386,175 @@ def test_chars_is_text_length():
 
 test_chars_is_text_length()
 print("chars_is_text_length:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- Qwen voice assignment preference ---
+def test_qwen_voice_assignment():
+    """When is_qwen=True, assign_voices should use Qwen voices (Cherry, Ethan, etc.)."""
+    global fails
+
+    hosts = [
+        Host(name="Alice", gender="female"),
+        Host(name="Bob", gender="male"),
+    ]
+
+    assigned = assign_voices(hosts, language="en", is_qwen=True)
+    qwen_ids = {v["id"] for v in QWEN_VOICES}
+
+    for voice_id in assigned:
+        if voice_id not in qwen_ids:
+            fails.append(f"Qwen mode assigned non-Qwen voice: {voice_id}")
+
+    if len(set(assigned)) != len(assigned):
+        fails.append(f"Qwen mode assigned duplicate voices: {assigned}")
+
+
+test_qwen_voice_assignment()
+print("qwen_voice_assignment:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- Qwen voice listing ---
+def test_qwen_voice_listing():
+    """list_voices with is_qwen=True should return only Qwen voices."""
+    global fails
+
+    qwen_list = list_voices(is_qwen=True)
+    qwen_ids = {v["id"] for v in QWEN_VOICES}
+
+    for voice in qwen_list:
+        if voice["id"] not in qwen_ids:
+            fails.append(f"list_voices(is_qwen=True) returned non-Qwen voice: {voice['id']}")
+
+    standard_list = list_voices(is_qwen=False)
+    if standard_list == qwen_list:
+        fails.append("Standard and Qwen voice lists should be different")
+
+
+test_qwen_voice_listing()
+print("qwen_voice_listing:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- load_catalog with is_qwen ---
+def test_load_catalog_qwen():
+    """load_catalog(is_qwen=True) should return Qwen voices."""
+    global fails
+
+    qwen_catalog = load_catalog(is_qwen=True)
+    qwen_ids = {v["id"] for v in QWEN_VOICES}
+
+    for voice in qwen_catalog:
+        if voice["id"] not in qwen_ids:
+            fails.append(f"load_catalog(is_qwen=True) returned non-Qwen voice: {voice['id']}")
+
+    if len(qwen_catalog) != len(QWEN_VOICES):
+        fails.append(f"Expected {len(QWEN_VOICES)} Qwen voices, got {len(qwen_catalog)}")
+
+
+test_load_catalog_qwen()
+print("load_catalog_qwen:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- build_hosts with Qwen config ---
+def test_build_hosts_qwen_config():
+    """build_hosts with Qwen TTS config should assign Qwen voices."""
+    global fails
+
+    qwen_cfg = {
+        "tts_model": "qwen3-tts-flash",
+        "tts_base_url": "https://api.modelverse.cn/v1",
+    }
+
+    req = PodcastRequest(host_count=2, host_genders=["male", "female"], language="en")
+    hosts = build_hosts(req, qwen_cfg)
+    qwen_ids = {v["id"] for v in QWEN_VOICES}
+
+    for host in hosts:
+        if host.voice_id not in qwen_ids:
+            fails.append(f"build_hosts with Qwen config assigned non-Qwen voice: {host.voice_id}")
+
+    if len({h.voice_id for h in hosts}) != len(hosts):
+        fails.append(f"build_hosts assigned duplicate voices: {[h.voice_id for h in hosts]}")
+
+
+test_build_hosts_qwen_config()
+print("build_hosts_qwen_config:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- build_hosts without config still uses MiniMax voices ---
+def test_build_hosts_no_config():
+    """build_hosts without config should use MiniMax voices (backward compatibility)."""
+    global fails
+
+    req = PodcastRequest(host_count=2, host_genders=["male", "female"], language="en")
+    hosts = build_hosts(req)
+    qwen_ids = {v["id"] for v in QWEN_VOICES}
+
+    has_minimax = False
+    for host in hosts:
+        if host.voice_id not in qwen_ids:
+            has_minimax = True
+            break
+
+    if not has_minimax:
+        fails.append("build_hosts without config should use MiniMax voices")
+
+
+test_build_hosts_no_config()
+print("build_hosts_no_config:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- Qwen max_chars is used in TTS client ---
+def test_qwen_tts_max_chars_method():
+    """OpenAICompatTTS.max_chars() should return 600 for Qwen dialect."""
+    global fails
+
+    qwen_tts = OpenAICompatTTS(
+        base_url="https://api.modelverse.cn/v1",
+        api_key="test-key",
+        model="qwen3-tts-flash",
+    )
+
+    if qwen_tts.max_chars() != QWEN_MAX_CHARS:
+        fails.append(f"Qwen TTS max_chars() should be {QWEN_MAX_CHARS}, got {qwen_tts.max_chars()}")
+
+    standard_tts = OpenAICompatTTS(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="tts-1",
+    )
+
+    if standard_tts.max_chars() != 4000:
+        fails.append(f"Standard TTS max_chars() should be 4000, got {standard_tts.max_chars()}")
+
+
+test_qwen_tts_max_chars_method()
+print("qwen_tts_max_chars_method:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- Gender preference in Qwen voice assignment ---
+def test_qwen_gender_preference():
+    """Qwen voice assignment should respect gender preferences."""
+    global fails
+
+    male_hosts = [Host(name="Bob", gender="male")]
+    female_hosts = [Host(name="Alice", gender="female")]
+
+    male_assigned = assign_voices(male_hosts, is_qwen=True)
+    female_assigned = assign_voices(female_hosts, is_qwen=True)
+
+    qwen_male_voices = {v["id"] for v in QWEN_VOICES if v.get("gender") == "male"}
+    qwen_female_voices = {v["id"] for v in QWEN_VOICES if v.get("gender") == "female"}
+
+    if male_assigned[0] not in qwen_male_voices:
+        fails.append(f"Male host should get male Qwen voice, got {male_assigned[0]}")
+
+    if female_assigned[0] not in qwen_female_voices:
+        fails.append(f"Female host should get female Qwen voice, got {female_assigned[0]}")
+
+
+test_qwen_gender_preference()
+print("qwen_gender_preference:", "PASS" if not fails else f"FAIL {fails}")
+
 
 print()
 if fails:
