@@ -104,8 +104,11 @@ async def test_config(request: Request) -> dict[str, Any]:
             else:
                 text = "语音测试。"
                 voice_id = voices_mod.load_catalog()[0]["id"]
-            engine.synthesize(text, voice_id, out, language="en" if is_qwen else "zh")
-            size = out.stat().st_size
+            result = engine.synthesize(text, voice_id, out, language="en" if is_qwen else "zh")
+            audio_path = result.path
+            if not audio_path.exists():
+                raise RuntimeError(f"TTS returned path {audio_path} but file does not exist")
+            size = audio_path.stat().st_size
         tts.update({"ok": size > 1000, "message": f"Connected — generated {size:,} bytes of audio"})
     except Exception as exc:
         tts.update({"ok": False, "message": str(exc)[:400]})
@@ -134,10 +137,13 @@ async def verify_voice(request: Request) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "v.mp3"
         try:
-            engine.synthesize(text, voice_id, out, language=payload.get("language", "zh"))
+            result = engine.synthesize(text, voice_id, out, language=payload.get("language", "zh"))
+            audio_path = result.path
+            if not audio_path.exists():
+                raise RuntimeError(f"TTS returned path {audio_path} but file does not exist")
+            size = audio_path.stat().st_size
         except Exception as exc:
             return {"ok": False, "voice_id": voice_id, "message": str(exc)[:400]}
-        size = out.stat().st_size
     return {"ok": True, "voice_id": voice_id, "message": f"Voice works — {size:,} bytes generated"}
 
 

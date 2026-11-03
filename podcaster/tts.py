@@ -72,6 +72,42 @@ def is_qwen_dialect(model: str, base_url: str) -> bool:
     return "qwen" in model_lower or "modelverse" in url_lower
 
 
+def _convert_wav_to_mp3(wav_bytes: bytes, out_path: Path) -> Path:
+    """Convert WAV audio bytes to MP3 and write to out_path using ffmpeg.
+    
+    This ensures callers receive the file at the exact path they requested,
+    rather than a different extension based on what the API returned.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        out_path.write_bytes(wav_bytes)
+        return out_path
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(wav_bytes)
+        tmp_wav = Path(tmp.name)
+
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            ffmpeg, "-y", "-i", str(tmp_wav),
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            "-ar", "44100", "-ac", "1",
+            str(out_path)
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        if proc.returncode != 0:
+            out_path.write_bytes(wav_bytes)
+            return out_path
+        return out_path
+    finally:
+        tmp_wav.unlink(missing_ok=True)
+
+
 class _RateLimiter:
     """Keeps us under the provider's requests-per-minute ceiling."""
 
@@ -256,10 +292,17 @@ class OpenAICompatTTS:
             "response_format": "mp3",
         }
 
-    def _handle_response(self, response: httpx.Response, out_path: Path) -> ClipResult:
-        """Handle response: binary audio (standard OpenAI) or JSON+URL (Qwen)."""
+    def _handle_response(self, response: httpx.Response, out_path: Path,
+                         source_text: str = "") -> ClipResult:
+        """Handle response: binary audio (standard OpenAI) or JSON+URL (Qwen).
+        
+        For Qwen dialect, the API returns JSON with an audio URL (often .wav).
+        If the caller requests .mp3 but the API returns .wav, we convert using
+        ffmpeg to ensure the file is written at the exact path the caller expects.
+        """
         content_type = response.headers.get("content-type", "").lower()
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        text_chars = len(source_text) if source_text else 0
 
         if self._is_qwen or "application/json" in content_type:
             try:
@@ -280,13 +323,19 @@ class OpenAICompatTTS:
 
             audio_bytes = audio_resp.content
             audio_type = audio_resp.headers.get("content-type", "").lower()
-            fmt = "wav" if "wav" in audio_type else "mp3"
-            actual_path = out_path.with_suffix(f".{fmt}")
-            actual_path.write_bytes(audio_bytes)
-            return ClipResult(path=actual_path, chars=len(audio_bytes), format=fmt)
+            is_wav = "wav" in audio_type
+            wants_mp3 = out_path.suffix.lower() == ".mp3"
+
+            if is_wav and wants_mp3:
+                result = _convert_wav_to_mp3(audio_bytes, out_path)
+                return ClipResult(path=result, chars=text_chars, format="mp3")
+
+            out_path.write_bytes(audio_bytes)
+            fmt = "wav" if is_wav else "mp3"
+            return ClipResult(path=out_path, chars=text_chars, format=fmt)
 
         out_path.write_bytes(response.content)
-        return ClipResult(path=out_path, chars=len(response.content), format="mp3")
+        return ClipResult(path=out_path, chars=text_chars, format="mp3")
 
     def max_chars(self) -> int:
         """Return the maximum characters per request for this dialect."""
@@ -322,7 +371,7 @@ class OpenAICompatTTS:
                     continue
                 raise TTSError(f"TTS HTTP {response.status_code}: {detail}")
 
-            return self._handle_response(response, out_path)
+            return self._handle_response(response, out_path, source_text=text)
 
         raise TTSError(f"TTS request failed after retries: {last_error}")
 
