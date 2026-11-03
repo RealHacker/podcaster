@@ -55,6 +55,29 @@ BUILTIN: list[dict[str, Any]] = [
      "gender": "female", "tone": "poetic, gentle"},
 ]
 
+# ModelVerse Qwen TTS voices (qwen3-tts-flash model).
+# These support both Chinese and English with language_type metadata.
+QWEN_VOICES: list[dict[str, Any]] = [
+    {"id": "Cherry", "label": "Cherry (Qwen)",
+     "gender": "female", "tone": "warm, expressive", "provider": "qwen"},
+    {"id": "Ethan", "label": "Ethan (Qwen)",
+     "gender": "male", "tone": "confident, clear", "provider": "qwen"},
+    {"id": "Serena", "label": "Serena (Qwen)",
+     "gender": "female", "tone": "calm, professional", "provider": "qwen"},
+    {"id": "Chelsie", "label": "Chelsie (Qwen)",
+     "gender": "female", "tone": "friendly, upbeat", "provider": "qwen"},
+]
+
+
+def get_qwen_voices() -> list[dict[str, Any]]:
+    """Return voices available for ModelVerse Qwen TTS."""
+    return [dict(v) for v in QWEN_VOICES]
+
+
+def get_default_qwen_voice() -> str:
+    """Return the default voice id for Qwen TTS connection testing."""
+    return "Cherry"
+
 _LANG_HINTS = {
     "zh": ("male-qn", "female-", "chinese (mandarin)", "presenter", "audiobook",
            "english_upbeat", "english_trustworthy"),

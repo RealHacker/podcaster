@@ -89,13 +89,22 @@ async def test_config(request: Request) -> dict[str, Any]:
 
     tts = {"provider": cfg.get("tts_provider", "minimax")}
     try:
-        from podcaster.tts import build_tts
+        from podcaster.tts import build_tts, is_qwen_dialect
 
         engine = build_tts(cfg)
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "probe.mp3"
-            text = "语音测试。" if cfg.get("tts_provider") != "openai" else "Voice test."
-            engine.synthesize(text, voices_mod.load_catalog()[0]["id"], out, language="zh")
+            is_qwen = is_qwen_dialect(cfg.get("tts_model", ""), cfg.get("tts_base_url", ""))
+            if is_qwen:
+                text = "Voice test." if cfg.get("tts_provider") == "openai" else "语音测试。"
+                voice_id = voices_mod.get_default_qwen_voice()
+            elif cfg.get("tts_provider") == "openai":
+                text = "Voice test."
+                voice_id = voices_mod.load_catalog()[0]["id"]
+            else:
+                text = "语音测试。"
+                voice_id = voices_mod.load_catalog()[0]["id"]
+            engine.synthesize(text, voice_id, out, language="en" if is_qwen else "zh")
             size = out.stat().st_size
         tts.update({"ok": size > 1000, "message": f"Connected — generated {size:,} bytes of audio"})
     except Exception as exc:

@@ -71,6 +71,26 @@ key above unless you give it a different one.
 Use **Test connections** to verify both endpoints, and **Test voice** to check
 a specific `voice_id` before assigning it to a host.
 
+### ModelVerse Qwen TTS
+
+To use Alibaba's Qwen TTS via ModelVerse:
+
+| Setting | Value |
+| --- | --- |
+| TTS provider | `openai` (OpenAI-compatible) |
+| TTS base URL | `https://api.modelverse.cn/v1` |
+| TTS model | `qwen3-tts-flash` |
+| Voices | `Cherry`, `Ethan`, `Serena`, `Chelsie` |
+
+**Limitations:**
+- Maximum 600 characters per request (long turns are automatically split)
+- The `speed` parameter is not supported
+- Supports `Chinese`, `English`, and `Auto` language detection via metadata
+
+The Qwen dialect is auto-detected from the model name (`qwen`) or base URL
+(`modelverse`). Audio is returned as a downloadable URL and fetched
+automatically.
+
 ---
 
 ## Using it
