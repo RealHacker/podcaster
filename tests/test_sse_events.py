@@ -214,6 +214,47 @@ def test_job_review_data() -> None:
           "review_data included when in review status")
 
 
+def test_script_review_delete_turn() -> None:
+    """The PATCH /api/jobs/{id}/script endpoint removes deleted turns."""
+    from fastapi.testclient import TestClient
+    from podcaster.jobs import Job
+    from podcaster.pipeline import PodcastRequest
+    from app import app, store
+
+    job = Job(id="delete-turn-test", request=PodcastRequest(enable_review=True))
+    job.set_review_data(
+        script_title="Delete Test",
+        script_outline=["Intro", "Main", "Outro"],
+        script_turns=[
+            {"index": 0, "speaker": "Alice", "text": "First turn"},
+            {"index": 1, "speaker": "Bob", "text": "Second turn"},
+            {"index": 2, "speaker": "Alice", "text": "Third turn"},
+        ],
+    )
+    job.status = "awaiting_script_review"
+    store._jobs[job.id] = job
+
+    with TestClient(app) as client:
+        response = client.patch(
+            f"/api/jobs/{job.id}/script",
+            json={"turns": [
+                {"index": 0, "speaker": "Alice", "text": "First turn"},
+                {"index": 2, "speaker": "Alice", "text": "Third turn"},
+            ]},
+        )
+        check(response.status_code == 200,
+              f"PATCH returns 200 ({response.status_code})")
+        check(len(job.review_data.script_turns) == 2,
+              f"two turns remain after delete ({len(job.review_data.script_turns)})")
+        texts = [t["text"] for t in job.review_data.script_turns]
+        check("Second turn" not in texts,
+              f"deleted turn is removed ({texts})")
+        check("First turn" in texts and "Third turn" in texts,
+              f"remaining turns are preserved ({texts})")
+
+    del store._jobs[job.id]
+
+
 if __name__ == "__main__":
     print("=== job event contract")
     test_job_event_contract()
@@ -223,6 +264,8 @@ if __name__ == "__main__":
     test_review_statuses_non_terminal()
     print("\n=== review data")
     test_job_review_data()
+    print("\n=== script review delete turn")
+    test_script_review_delete_turn()
     print()
     if failures:
         print(f"FAILED: {len(failures)} check(s)")
