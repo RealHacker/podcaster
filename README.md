@@ -22,16 +22,31 @@ source (pdf / md / url / text)
 
 ## Quick start
 
+### Windows (PowerShell)
+
 ```powershell
 cd E:\Voice\Podcaster
 .\run.ps1
 ```
 
+### Mac/Linux (Bash)
+
+```bash
+cd ~/Voice/Podcaster
+./run.sh
+```
+
 Then open <http://127.0.0.1:8760>.
 
-`run.ps1` loads `env.ps1` (your MiniMax key), installs any missing Python
-packages, checks for `ffmpeg`, and starts the server. Use `-Port 9000` to
-change the port or `-Reload` while developing.
+Both launchers load environment variables (`env.ps1` / `env.sh` for your MiniMax
+key), install any missing Python packages, check for `ffmpeg`, and start the
+server.
+
+| Option | PowerShell | Bash |
+| --- | --- | --- |
+| Port | `-Port 9000` | `--port 9000` |
+| Address | `-Address 0.0.0.0` | `--address 0.0.0.0` |
+| Auto-reload | `-Reload` | `--reload` |
 
 ### Settings tab
 
@@ -99,6 +114,29 @@ curious listener.
 Set an explicit output path, or leave it blank to get a timestamped file in
 the output folder.
 
+### Review gates (optional)
+
+Check **Enable review gates** to pause the pipeline before expensive steps:
+
+1. **Script review** — After the LLM writes the script, the job pauses in
+   `awaiting_script_review`. The Jobs tab shows the script turns; you can
+   edit any turn's text or speaker, add notes and regenerate, then approve
+   to continue.
+
+2. **Audio review** — After all TTS clips are generated, the job pauses in
+   `awaiting_audio_review`. You can play each clip and regenerate individual
+   turns (optionally with updated text or voice), then approve to merge.
+
+3. **Slides review** (video + illustrated slides only) — After slide images
+   are generated, the job pauses in `awaiting_slides_review`. You can
+   regenerate any slide with a different prompt, then approve to render.
+
+Review-waiting statuses keep the SSE stream open (only `done`, `error`, and
+`cancelled` are terminal). Cancel still works at any review gate.
+
+When review is disabled (the default), the pipeline runs straight through
+as before.
+
 ---
 
 ## How the script is written
@@ -114,6 +152,15 @@ the output folder.
 
 TTS is then called once per turn. Turns longer than the provider's limit are
 split on sentence boundaries and stitched back together.
+
+### Parallel TTS (optional)
+
+In **Settings**, enable **Parallel TTS** to synthesize multiple turns
+concurrently. The worker count (default 2, max 6) controls how many turns
+are processed at once. The shared rate limiter keeps requests under the
+provider's per-minute ceiling, so parallel mode speeds up long episodes
+without hitting rate limits. Clip ordering and subtitle timing are preserved.
+Cancellation stops outstanding work.
 
 ## How the video is built
 

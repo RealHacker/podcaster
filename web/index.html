@@ -152,6 +152,11 @@
             <span>Show subtitles on the video</span>
           </label>
 
+          <label class="field inline">
+            <input type="checkbox" id="enableReview" />
+            <span>Enable review gates <em class="hint">Pause to review script, audio, slides</em></span>
+          </label>
+
           <label class="field">
             <span>Output file path</span>
             <div class="path-row">
@@ -222,6 +227,17 @@
             <span class="progress-label" id="jdStep">—</span>
           </div>
           <div class="jd-actions" id="jdActions"></div>
+          <!-- Review panel (shown when job is awaiting review) -->
+          <div class="jd-review" id="jdReview" hidden>
+            <div class="review-header">
+              <h3 id="reviewTitle">Review</h3>
+              <div class="review-actions">
+                <button class="btn ghost sm" id="reviewRegenerate">Regenerate</button>
+                <button class="btn primary sm" id="reviewApprove">Approve &amp; Continue</button>
+              </div>
+            </div>
+            <div class="review-content" id="reviewContent"></div>
+          </div>
           <div class="jd-body">
             <div class="jd-logs">
               <h3>Activity</h3>
@@ -306,6 +322,19 @@
             <span>Default output folder</span>
             <input type="text" id="outputDir" />
           </label>
+          <hr />
+          <h3 class="sub">Parallel TTS</h3>
+          <p class="muted small">Process multiple audio turns at once. Respects the rate limiter.</p>
+          <div class="row-2">
+            <label class="field inline">
+              <input type="checkbox" id="ttsParallel" />
+              <span>Enable parallel TTS</span>
+            </label>
+            <label class="field">
+              <span>Workers</span>
+              <input type="number" id="ttsParallelWorkers" min="1" max="6" step="1" value="2" />
+            </label>
+          </div>
           <hr />
           <h3 class="sub">Images</h3>
           <p class="muted small">Used for the illustrated slides of a video export. Uses the

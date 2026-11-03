@@ -320,6 +320,7 @@
       export_path: $("#exportPath").value.trim(),
       show_subtitles: $("#showSubtitles").checked,
       show_slides: $("#showSlides").checked,
+      enable_review: $("#enableReview").checked,
       title: $("#podTitle").value.trim(),
       extra_instructions: $("#extraInstructions").value.trim(),
       tts_speed: Number($("#ttsSpeed").value),
@@ -397,6 +398,8 @@
     renderJob(job);
   }
 
+  const REVIEW_STATUSES = ["awaiting_script_review", "awaiting_audio_review", "awaiting_slides_review"];
+
   function renderJob(job) {
     state.activeJob = job;
     $("#jobEmpty").hidden = true;
@@ -410,10 +413,11 @@
       job.request.style,
       `${job.request.length_minutes} min target`,
       job.request.export_format,
+      job.request.enable_review ? "review enabled" : "",
       `started ${fmtTime(job.started_at)}`,
-    ].join(" · ");
+    ].filter(Boolean).join(" · ");
     const pill = $("#jdStatus");
-    pill.textContent = job.status;
+    pill.textContent = job.status.replace(/_/g, " ");
     pill.className = `status-pill ${job.status}`;
     $("#jdProgress").style.width = `${Math.round((job.progress || 0) * 100)}%`;
     $("#jdStep").textContent = job.step || "—";
@@ -431,6 +435,8 @@
     const script = $("#jdScript");
     if (job.result && job.result.script_text) {
       script.textContent = job.result.script_text;
+    } else if (job.review_data && job.review_data.script_turns && job.review_data.script_turns.length) {
+      script.textContent = job.review_data.script_turns.map(t => `${t.speaker}: ${t.text}`).join("\n");
     } else {
       script.innerHTML = `<p class="muted">Not available yet.</p>`;
     }
@@ -466,6 +472,196 @@
       err.textContent = job.error;
       actions.appendChild(err);
     }
+
+    renderReviewPanel(job);
+  }
+
+  function renderReviewPanel(job) {
+    const panel = $("#jdReview");
+    const content = $("#reviewContent");
+    const titleEl = $("#reviewTitle");
+
+    if (!REVIEW_STATUSES.includes(job.status)) {
+      panel.hidden = true;
+      return;
+    }
+
+    panel.hidden = false;
+    content.innerHTML = "";
+
+    if (job.status === "awaiting_script_review") {
+      titleEl.textContent = "Script Review";
+      const data = job.review_data || {};
+      const turns = data.script_turns || [];
+      const hosts = (data.hosts || []).map(h => h.name);
+
+      if (data.script_title) {
+        const titleField = document.createElement("div");
+        titleField.className = "review-turn";
+        titleField.innerHTML = `
+          <span class="review-turn-speaker">Title</span>
+          <input type="text" class="review-title-input" value="${escapeHtml(data.script_title)}" />
+          <span></span>`;
+        content.appendChild(titleField);
+      }
+
+      turns.forEach((turn, i) => {
+        const row = document.createElement("div");
+        row.className = "review-turn";
+        row.dataset.index = turn.index;
+        row.innerHTML = `
+          <select class="review-turn-speaker-select">
+            ${hosts.map(h => `<option value="${escapeHtml(h)}"${h === turn.speaker ? " selected" : ""}>${escapeHtml(h)}</option>`).join("")}
+          </select>
+          <textarea class="review-turn-text">${escapeHtml(turn.text)}</textarea>
+          <button class="btn ghost sm review-turn-delete" title="Remove turn">✕</button>`;
+        content.appendChild(row);
+      });
+
+      const notes = document.createElement("div");
+      notes.className = "review-notes";
+      notes.innerHTML = `
+        <label class="field">
+          <span>Notes for regeneration <em class="hint">optional</em></span>
+          <textarea id="reviewNotes" rows="2" placeholder="Add instructions for regenerating the script..."></textarea>
+        </label>`;
+      content.appendChild(notes);
+
+      $("#reviewRegenerate").onclick = () => regenerateScript(job.id);
+      $("#reviewRegenerate").hidden = false;
+
+    } else if (job.status === "awaiting_audio_review") {
+      titleEl.textContent = "Audio Review";
+      const data = job.review_data || {};
+      const clips = data.audio_clips || [];
+
+      clips.forEach((clip) => {
+        const row = document.createElement("div");
+        row.className = "review-clip";
+        row.dataset.index = clip.index;
+        const audioSrc = clip.files && clip.files[0]
+          ? `/api/jobs/${job.id}/clips/${clip.files[0]}`
+          : "";
+        row.innerHTML = `
+          <span class="review-turn-speaker">${escapeHtml(clip.speaker)}</span>
+          <div>
+            <div class="review-turn-text" style="margin-bottom:6px">${escapeHtml(clip.text)}</div>
+            ${audioSrc ? `<audio controls src="${audioSrc}"></audio>` : "<span class='muted'>No audio</span>"}
+          </div>
+          <button class="btn ghost sm review-clip-regen" data-index="${clip.index}">Regenerate</button>`;
+        content.appendChild(row);
+      });
+
+      content.querySelectorAll(".review-clip-regen").forEach(btn => {
+        btn.onclick = () => regenerateClip(job.id, parseInt(btn.dataset.index, 10));
+      });
+      $("#reviewRegenerate").hidden = true;
+
+    } else if (job.status === "awaiting_slides_review") {
+      titleEl.textContent = "Slides Review";
+      const data = job.review_data || {};
+      const slides = data.slides || [];
+
+      slides.forEach((slide) => {
+        const row = document.createElement("div");
+        row.className = "review-slide";
+        row.dataset.index = slide.index;
+        const imgPath = slide.image ? slide.image.split(/[\\/]/).pop() : "";
+        const imgSrc = imgPath ? `/api/jobs/${job.id}/slides/${imgPath}` : "";
+        row.innerHTML = `
+          ${imgSrc ? `<img src="${imgSrc}" alt="Slide ${slide.index + 1}" />` : "<div style='width:160px;height:90px;background:#0a1220;border-radius:6px'></div>"}
+          <div>
+            <strong>Slide ${slide.index + 1}: ${escapeHtml(slide.title || "")}</strong>
+            <div class="review-slide-prompt">${escapeHtml(slide.prompt || "")}</div>
+            <input type="text" class="slide-prompt-input" placeholder="New prompt..." style="margin-top:8px" />
+          </div>
+          <button class="btn ghost sm review-slide-regen" data-index="${slide.index}">Regenerate</button>`;
+        content.appendChild(row);
+      });
+
+      content.querySelectorAll(".review-slide-regen").forEach(btn => {
+        btn.onclick = () => {
+          const row = btn.closest(".review-slide");
+          const prompt = row.querySelector(".slide-prompt-input").value.trim();
+          if (!prompt) { toast("Enter a new prompt", "err"); return; }
+          regenerateSlide(job.id, parseInt(btn.dataset.index, 10), prompt);
+        };
+      });
+      $("#reviewRegenerate").hidden = true;
+    }
+
+    $("#reviewApprove").onclick = () => approveReview(job.id);
+  }
+
+  async function approveReview(jobId) {
+    try {
+      if (state.activeJob && state.activeJob.status === "awaiting_script_review") {
+        await saveScriptEdits(jobId);
+      }
+      await api(`/api/jobs/${jobId}/approve`, { method: "POST" });
+      toast("Review approved", "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  }
+
+  async function saveScriptEdits(jobId) {
+    const titleInput = $(".review-title-input");
+    const turns = [];
+    $$("#reviewContent .review-turn").forEach(row => {
+      if (row.querySelector(".review-title-input")) return;
+      const speaker = row.querySelector(".review-turn-speaker-select")?.value || "";
+      const text = row.querySelector(".review-turn-text")?.value || "";
+      turns.push({ index: parseInt(row.dataset.index, 10), speaker, text });
+    });
+    const payload = { turns };
+    if (titleInput) payload.title = titleInput.value.trim();
+    await api(`/api/jobs/${jobId}/script`, { method: "PATCH", body: JSON.stringify(payload) });
+  }
+
+  async function regenerateScript(jobId) {
+    const notes = $("#reviewNotes")?.value || "";
+    try {
+      toast("Regenerating script...");
+      const data = await api(`/api/jobs/${jobId}/script/regenerate`, {
+        method: "POST", body: JSON.stringify({ notes })
+      });
+      if (state.activeJob) {
+        state.activeJob.review_data = data.script;
+        renderReviewPanel(state.activeJob);
+      }
+      toast("Script regenerated", "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  }
+
+  async function regenerateClip(jobId, turnIndex) {
+    try {
+      toast(`Regenerating turn ${turnIndex + 1}...`);
+      await api(`/api/jobs/${jobId}/clips/${turnIndex}/regenerate`, {
+        method: "POST", body: JSON.stringify({})
+      });
+      const job = await api(`/api/jobs/${jobId}`);
+      renderJob(job);
+      toast(`Turn ${turnIndex + 1} regenerated`, "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  }
+
+  async function regenerateSlide(jobId, slideIndex, prompt) {
+    try {
+      toast(`Regenerating slide ${slideIndex + 1}...`);
+      await api(`/api/jobs/${jobId}/slides/${slideIndex}/regenerate`, {
+        method: "POST", body: JSON.stringify({ prompt })
+      });
+      const job = await api(`/api/jobs/${jobId}`);
+      renderJob(job);
+      toast(`Slide ${slideIndex + 1} regenerated`, "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
   }
 
   function openStream(jobId) {
@@ -474,9 +670,11 @@
     state.eventSource = es;
     let lastSeq = 0;
 
+    const TERMINAL = ["done", "error", "cancelled"];
+
     const setStatusPill = (status) => {
       const pill = $("#jdStatus");
-      pill.textContent = status;
+      pill.textContent = status.replace(/_/g, " ");
       pill.className = `status-pill ${status}`;
     };
 
@@ -484,16 +682,13 @@
       let payload;
       try { payload = JSON.parse(msg.data); } catch { return; }
       if (payload.type === "snapshot") {
-        // The snapshot already contains every event up to this sequence number.
         lastSeq = payload.job.seq || 0;
         renderJob(payload.job);
-        if (["done", "error", "cancelled"].includes(payload.job.status)) {
-          // Nothing more will arrive — closing avoids a reconnect loop.
+        if (TERMINAL.includes(payload.job.status)) {
           es.close();
         }
         return;
       }
-      // Drop events the snapshot already covered, so nothing is rendered twice.
       if (payload.seq && payload.seq <= lastSeq) return;
       lastSeq = payload.seq || lastSeq;
 
@@ -520,19 +715,32 @@
         box.scrollTop = box.scrollHeight;
         return;
       }
+      if (payload.type === "review_data") {
+        const job = state.activeJob;
+        if (job) {
+          job.review_data = payload.data;
+          renderReviewPanel(job);
+        }
+        return;
+      }
       if (payload.type === "status") {
         const status = payload.status;
-        if (status !== "done" && status !== "error" && status !== "cancelled") {
-          // A non-terminal status (e.g. "running") must not close the stream.
-          setStatusPill(status);
-          if (state.activeJob) state.activeJob.status = status;
-          loadJobs();
+        setStatusPill(status);
+        if (state.activeJob) state.activeJob.status = status;
+        loadJobs();
+
+        if (REVIEW_STATUSES.includes(status)) {
+          const job = await api(`/api/jobs/${jobId}`);
+          renderJob(job);
+          toast(`Review required: ${status.replace(/_/g, " ")}`, "ok");
+          return;
+        }
+        if (!TERMINAL.includes(status)) {
           return;
         }
         es.close();
         const job = await api(`/api/jobs/${jobId}`);
         renderJob(job);
-        loadJobs();
         toast(status === "done" ? "Podcast ready" :
               status === "error" ? "Job failed" : "Job cancelled",
               status === "done" ? "ok" : "err");
@@ -552,6 +760,7 @@
     llm_temperature: "#llmTemperature", llm_max_tokens: "#llmMaxTokens",
     tts_provider: "#ttsProvider", tts_base_url: "#ttsBaseUrl", tts_model: "#ttsModel",
     tts_api_key: "#ttsApiKey", output_dir: "#outputDir",
+    tts_parallel: "#ttsParallel", tts_parallel_workers: "#ttsParallelWorkers",
     image_base_url: "#imageBaseUrl", image_model: "#imageModel", image_api_key: "#imageApiKey",
   };
 
@@ -563,6 +772,8 @@
       if (key.endsWith("_api_key")) {
         el.value = "";
         el.placeholder = cfg[`${key}_set`] ? `saved (${cfg[`${key}_hint`]}) — type to replace` : "sk-…";
+      } else if (el.type === "checkbox") {
+        el.checked = !!cfg[key];
       } else {
         el.value = cfg[key] ?? "";
       }
@@ -575,10 +786,17 @@
     Object.entries(CONFIG_FIELDS).forEach(([key, selector]) => {
       const el = $(selector);
       if (!el) return;
-      const value = el.value.trim();
-      if (key.endsWith("_api_key") && !value) return;  // keep existing
-      payload[key] = key === "llm_temperature" || key === "llm_max_tokens"
-        ? Number(value) : value;
+      if (key.endsWith("_api_key")) {
+        const value = el.value.trim();
+        if (!value) return;  // keep existing
+        payload[key] = value;
+      } else if (el.type === "checkbox") {
+        payload[key] = el.checked;
+      } else if (key === "llm_temperature" || key === "llm_max_tokens" || key === "tts_parallel_workers") {
+        payload[key] = Number(el.value);
+      } else {
+        payload[key] = el.value.trim();
+      }
     });
     try {
       await api("/api/config", { method: "PUT", body: JSON.stringify(payload) });

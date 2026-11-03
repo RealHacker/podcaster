@@ -1,6 +1,7 @@
 """Job registry: creation, progress tracking and a live event feed."""
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -13,12 +14,36 @@ from typing import Any
 from . import config as config_mod
 from .pipeline import PodcastRequest, PipelineError, run_pipeline
 
+REVIEW_STATUSES = ("awaiting_script_review", "awaiting_audio_review", "awaiting_slides_review")
+TERMINAL_STATUSES = ("done", "error", "cancelled")
+
+
+@dataclass
+class ReviewData:
+    """Holds reviewable artifacts at a particular stage."""
+    script_title: str = ""
+    script_outline: list[str] = field(default_factory=list)
+    script_turns: list[dict[str, Any]] = field(default_factory=list)
+    audio_clips: list[dict[str, Any]] = field(default_factory=list)
+    slides: list[dict[str, Any]] = field(default_factory=list)
+    hosts: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "script_title": self.script_title,
+            "script_outline": list(self.script_outline),
+            "script_turns": list(self.script_turns),
+            "audio_clips": list(self.audio_clips),
+            "slides": list(self.slides),
+            "hosts": list(self.hosts),
+        }
+
 
 @dataclass
 class Job:
     id: str
     request: PodcastRequest
-    status: str = "queued"          # queued | running | done | error | cancelled
+    status: str = "queued"          # queued | running | done | error | cancelled | awaiting_*_review
     step: str = "Queued"
     progress: float = 0.0
     message: str = ""
@@ -29,10 +54,13 @@ class Job:
     logs: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     workdir: str = ""
+    review_data: ReviewData = field(default_factory=ReviewData)
     _events: "queue.Queue[dict[str, Any]]" = field(default_factory=queue.Queue, repr=False)
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
+    _resume: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _seq: int = field(default=0, repr=False)
+    _pipeline_state: dict[str, Any] = field(default_factory=dict, repr=False)
 
     # -- updates ---------------------------------------------------------- #
     def _emit(self, payload: dict[str, Any]) -> None:
@@ -68,21 +96,68 @@ class Job:
             self.status = status
             if error:
                 self.error = error
-            if status in ("done", "error", "cancelled"):
+            if status in TERMINAL_STATUSES:
                 self.finished_at = time.time()
                 self.progress = 1.0 if status == "done" else self.progress
         self._emit({"type": "status", "status": status, "error": error})
 
     def cancel(self) -> None:
         self._cancel.set()
+        self._resume.set()
         self.log("warn", "Cancellation requested")
 
     @property
     def cancelled(self) -> bool:
         return self._cancel.is_set()
 
+    def wait_for_review(self, status: str, timeout: float | None = None) -> bool:
+        """Block until the user approves or cancels. Returns True if approved."""
+        self._resume.clear()
+        self.set_status(status)
+        self.log("info", f"Waiting for review ({status})")
+        approved = self._resume.wait(timeout=timeout)
+        return approved and not self.cancelled
+
+    def approve_and_resume(self) -> None:
+        """Signal the pipeline to continue after a review gate."""
+        self._resume.set()
+        self.log("info", "Review approved, resuming")
+
+    def set_review_data(self, **kwargs: Any) -> None:
+        """Update review data fields."""
+        with self._lock:
+            for key, value in kwargs.items():
+                if hasattr(self.review_data, key):
+                    setattr(self.review_data, key, value)
+        self._emit({"type": "review_data", "data": self.review_data.to_dict()})
+
+    def save_pipeline_state(self, key: str, value: Any) -> None:
+        """Save intermediate pipeline state for resumption."""
+        with self._lock:
+            self._pipeline_state[key] = value
+        state_file = Path(self.workdir) / "pipeline_state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            state_file.write_text(json.dumps(self._pipeline_state, default=str), encoding="utf-8")
+        except OSError:
+            pass
+
+    def load_pipeline_state(self, key: str, default: Any = None) -> Any:
+        """Load saved pipeline state."""
+        with self._lock:
+            if key in self._pipeline_state:
+                return self._pipeline_state[key]
+        state_file = Path(self.workdir) / "pipeline_state.json"
+        if state_file.exists():
+            try:
+                self._pipeline_state = json.loads(state_file.read_text(encoding="utf-8"))
+                return self._pipeline_state.get(key, default)
+            except (OSError, json.JSONDecodeError):
+                pass
+        return default
+
     # -- serialisation ---------------------------------------------------- #
-    def to_dict(self, include_logs: bool = True) -> dict[str, Any]:
+    def to_dict(self, include_logs: bool = True, include_review: bool = True) -> dict[str, Any]:
         with self._lock:
             data = {
                 "id": self.id,
@@ -107,10 +182,13 @@ class Job:
                     "title": self.request.title,
                     "source_type": self.request.source_type,
                     "source_url": self.request.source_url,
+                    "enable_review": getattr(self.request, "enable_review", False),
                 },
             }
             if include_logs:
                 data["logs"] = list(self.logs)
+            if include_review and self.status in REVIEW_STATUSES:
+                data["review_data"] = self.review_data.to_dict()
         return data
 
     @staticmethod
@@ -159,6 +237,7 @@ class JobStore:
                 on_step=job.set_step,
                 log=job.log,
                 should_cancel=lambda: job.cancelled,
+                job=job,
             )
             job.result = result
             job.set_status("done")

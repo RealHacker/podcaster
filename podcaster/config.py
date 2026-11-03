@@ -31,6 +31,8 @@ DEFAULTS: dict[str, Any] = {
     "tts_model": "speech-2.5-hd-preview",
     "tts_api_key": "",
     "tts_speed": 1.0,
+    "tts_parallel": False,
+    "tts_parallel_workers": 2,
     "image_base_url": "",
     "image_api_key": "",
     "image_model": "image-01",
