@@ -6,6 +6,7 @@ Covers:
 - JSON+URL response handling
 - Character limit (600 chars for Qwen)
 - Qwen voice assignment and listing
+- Subtitle fallback for OpenAI-compatible TTS
 """
 import json
 import sys
@@ -554,6 +555,153 @@ def test_qwen_gender_preference():
 
 test_qwen_gender_preference()
 print("qwen_gender_preference:", "PASS" if not fails else f"FAIL {fails}")
+
+
+# --- Subtitle fallback for OpenAI-compatible TTS ---
+def test_subtitle_fallback_when_enabled():
+    """When subtitle_enable=True and no provider cues, fallback generates approximate cues."""
+    global fails
+
+    qwen_tts = OpenAICompatTTS(
+        base_url="https://api.modelverse.cn/v1",
+        api_key="test-key",
+        model="qwen3-tts-flash",
+    )
+
+    mock_json_response = MagicMock()
+    mock_json_response.status_code = 200
+    mock_json_response.headers = {"content-type": "application/json"}
+    mock_json_response.json.return_value = {
+        "output": {
+            "audio": {
+                "url": "https://example.com/audio.mp3"
+            }
+        }
+    }
+
+    mock_audio_response = MagicMock()
+    mock_audio_response.content = b"\xff\xfb\x90\x00" + b"\x00" * 1000
+    mock_audio_response.headers = {"content-type": "audio/mpeg"}
+    mock_audio_response.raise_for_status = MagicMock()
+
+    test_text = "Hello world. This is a test of subtitle fallback."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "test.mp3"
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.return_value = mock_json_response
+            mock_client.get.return_value = mock_audio_response
+            mock_client_cls.return_value = mock_client
+
+            with patch("podcaster.tts._probe_duration_ms", return_value=5000.0):
+                result = qwen_tts.synthesize(
+                    test_text, "Cherry", out_path,
+                    subtitle_enable=True
+                )
+
+                if not result.subtitles:
+                    fails.append("subtitles should be generated when subtitle_enable=True")
+                elif len(result.subtitles) < 1:
+                    fails.append(f"expected at least 1 subtitle cue, got {len(result.subtitles)}")
+                else:
+                    joined = "".join(c.text for c in result.subtitles)
+                    if "Hello" not in joined:
+                        fails.append(f"subtitle cues missing expected text, got: {joined}")
+
+
+test_subtitle_fallback_when_enabled()
+print("subtitle_fallback_enabled:", "PASS" if not fails else f"FAIL {fails}")
+
+
+def test_subtitle_fallback_disabled():
+    """When subtitle_enable=False, no subtitle cues should be generated."""
+    global fails
+
+    openai_tts = OpenAICompatTTS(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="tts-1",
+    )
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "audio/mpeg"}
+    mock_response.content = b"\xff\xfb\x90\x00" + b"\x00" * 1000
+
+    test_text = "Hello world. This is a test."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "test.mp3"
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value = mock_client
+
+            result = openai_tts.synthesize(
+                test_text, "alloy", out_path,
+                subtitle_enable=False
+            )
+
+            if result.subtitles:
+                fails.append(
+                    f"subtitles should be empty when subtitle_enable=False, "
+                    f"got {len(result.subtitles)} cues"
+                )
+
+
+test_subtitle_fallback_disabled()
+print("subtitle_fallback_disabled:", "PASS" if not fails else f"FAIL {fails}")
+
+
+def test_subtitle_fallback_zero_duration():
+    """When audio duration is 0, no subtitle cues should be generated."""
+    global fails
+
+    openai_tts = OpenAICompatTTS(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="tts-1",
+    )
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "audio/mpeg"}
+    mock_response.content = b"\xff\xfb\x90\x00" + b"\x00" * 100
+
+    test_text = "Hello world."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "test.mp3"
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value = mock_client
+
+            with patch("podcaster.tts._probe_duration_ms", return_value=0.0):
+                result = openai_tts.synthesize(
+                    test_text, "alloy", out_path,
+                    subtitle_enable=True
+                )
+
+                if result.subtitles:
+                    fails.append(
+                        f"subtitles should be empty when duration is 0, "
+                        f"got {len(result.subtitles)} cues"
+                    )
+
+
+test_subtitle_fallback_zero_duration()
+print("subtitle_fallback_zero_duration:", "PASS" if not fails else f"FAIL {fails}")
 
 
 print()
