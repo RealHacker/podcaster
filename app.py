@@ -196,6 +196,7 @@ async def create_job(request: Request) -> dict[str, Any]:
             keep_workdir=bool(payload.get("keep_workdir", True)),
             show_subtitles=bool(payload.get("show_subtitles", False)),
             show_slides=bool(payload.get("show_slides", False)),
+            enable_review=bool(payload.get("enable_review", False)),
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, f"Invalid request: {exc}") from exc
@@ -241,6 +242,8 @@ async def job_events(job_id: str, request: Request) -> StreamingResponse:
     if not job:
         raise HTTPException(404, "Job not found")
 
+    from podcaster.jobs import TERMINAL_STATUSES
+
     async def stream():
         events = job._events
         snapshot = job.to_dict()
@@ -253,13 +256,285 @@ async def job_events(job_id: str, request: Request) -> StreamingResponse:
             except Exception:
                 yield ": keep-alive\n\n"
                 continue
-            if event.get("type") == "status" and event.get("status") in ("done", "error", "cancelled"):
+            if event.get("type") == "status" and event.get("status") in TERMINAL_STATUSES:
                 yield f"data: {json.dumps(event)}\n\n"
                 break
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# --------------------------------------------------------------------------- #
+# Review workflow API
+# --------------------------------------------------------------------------- #
+
+@app.get("/api/jobs/{job_id}/script")
+async def get_job_script(job_id: str) -> dict[str, Any]:
+    """Get the current script for review."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return {
+        "title": job.review_data.script_title,
+        "outline": job.review_data.script_outline,
+        "turns": job.review_data.script_turns,
+        "hosts": job.review_data.hosts,
+    }
+
+
+@app.patch("/api/jobs/{job_id}/script")
+async def patch_job_script(job_id: str, request: Request) -> dict[str, Any]:
+    """Update script turns or title during review."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != "awaiting_script_review":
+        raise HTTPException(400, "Job is not awaiting script review")
+
+    payload = await request.json()
+    if "title" in payload:
+        job.review_data.script_title = str(payload["title"]).strip()
+    if "turns" in payload:
+        turns = payload["turns"]
+        if not isinstance(turns, list):
+            raise HTTPException(400, "turns must be a list")
+        job.review_data.script_turns = [
+            {"index": t.get("index", i), "speaker": t.get("speaker", ""), "text": t.get("text", "")}
+            for i, t in enumerate(turns)
+        ]
+    job._emit({"type": "review_data", "data": job.review_data.to_dict()})
+    return {"ok": True, "script": job.review_data.to_dict()}
+
+
+@app.post("/api/jobs/{job_id}/script/regenerate")
+async def regenerate_job_script(job_id: str, request: Request) -> dict[str, Any]:
+    """Regenerate the script with optional notes (extra instructions)."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != "awaiting_script_review":
+        raise HTTPException(400, "Job is not awaiting script review")
+
+    payload = await request.json()
+    notes = str(payload.get("notes", "") or "").strip()
+
+    cfg = config_mod.load()
+    from podcaster.llm import LLMClient
+    from podcaster.script import generate_script, Host
+    from podcaster.chunking import split_into_chunks
+    from podcaster.pipeline import resolve_source, build_hosts
+
+    try:
+        doc = resolve_source(job.request)
+        chunks = split_into_chunks(doc.text, job.request.chunk_chars or 6000)
+        hosts = build_hosts(job.request)
+
+        client = LLMClient(
+            base_url=cfg.get("llm_base_url", ""),
+            api_key=cfg.get("llm_api_key", ""),
+            model=cfg.get("llm_model", ""),
+            temperature=float(cfg.get("llm_temperature", 0.7)),
+            max_tokens=int(cfg.get("llm_max_tokens", 4096)),
+        )
+
+        extra = job.request.extra_instructions
+        if notes:
+            extra = f"{extra}\n\n{notes}" if extra else notes
+
+        script = generate_script(
+            client,
+            source_text=doc.text,
+            chunks=chunks,
+            hosts=hosts,
+            language=job.request.language,
+            style=job.request.style,
+            target_minutes=job.request.length_minutes,
+            title_hint=job.request.title or doc.title,
+            extra_instructions=extra,
+        )
+
+        job.review_data.script_title = script.title
+        job.review_data.script_outline = list(script.outline)
+        job.review_data.script_turns = [
+            {"index": t.index, "speaker": t.speaker, "text": t.text}
+            for t in script.turns
+        ]
+        job._emit({"type": "review_data", "data": job.review_data.to_dict()})
+        job.log("info", f"Script regenerated: {len(script.turns)} turns")
+
+    except Exception as exc:
+        raise HTTPException(500, f"Script regeneration failed: {exc}") from exc
+
+    return {"ok": True, "script": job.review_data.to_dict()}
+
+
+@app.post("/api/jobs/{job_id}/approve")
+async def approve_job(job_id: str) -> dict[str, Any]:
+    """Approve the current review stage and continue the pipeline."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status not in ("awaiting_script_review", "awaiting_audio_review", "awaiting_slides_review"):
+        raise HTTPException(400, f"Job is not awaiting review (status: {job.status})")
+
+    job.approve_and_resume()
+    return {"ok": True, "status": job.status}
+
+
+@app.get("/api/jobs/{job_id}/clips")
+async def get_job_clips(job_id: str) -> dict[str, Any]:
+    """Get the audio clips for review."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return {
+        "clips": job.review_data.audio_clips,
+        "hosts": job.review_data.hosts,
+    }
+
+
+@app.get("/api/jobs/{job_id}/clips/{filename:path}")
+async def get_clip_file(job_id: str, filename: str) -> FileResponse:
+    """Serve an audio clip file from the job workdir."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    clips_dir = Path(job.workdir) / "clips"
+    clip_path = clips_dir / filename
+    if not clip_path.exists() or not clip_path.is_file():
+        raise HTTPException(404, "Clip not found")
+    if not clip_path.resolve().is_relative_to(clips_dir.resolve()):
+        raise HTTPException(403, "Access denied")
+
+    return FileResponse(str(clip_path), media_type="audio/mpeg", filename=filename)
+
+
+@app.post("/api/jobs/{job_id}/clips/{turn_index}/regenerate")
+async def regenerate_clip(job_id: str, turn_index: int, request: Request) -> dict[str, Any]:
+    """Regenerate a specific audio clip with optional updated text or voice."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != "awaiting_audio_review":
+        raise HTTPException(400, "Job is not awaiting audio review")
+
+    payload = await request.json()
+    new_text = payload.get("text")
+    new_voice_id = payload.get("voice_id")
+
+    clips = job.review_data.audio_clips
+    clip_data = next((c for c in clips if c["index"] == turn_index), None)
+    if not clip_data:
+        raise HTTPException(404, f"Turn {turn_index} not found")
+
+    cfg = config_mod.load()
+    from podcaster.tts import build_tts, split_for_tts
+
+    try:
+        tts_cfg = dict(cfg)
+        tts_cfg["tts_speed"] = job.request.tts_speed or cfg.get("tts_speed", 1.0)
+        tts = build_tts(tts_cfg)
+
+        text = new_text if new_text else clip_data["text"]
+        voice = new_voice_id if new_voice_id else clip_data["voice_id"]
+        max_chars = 4800 if "2.8" in (cfg.get("tts_model") or "") else 4000
+        want_subtitles = job.request.export_format == "video" and job.request.show_subtitles
+
+        clips_dir = Path(job.workdir) / "clips"
+        pieces = split_for_tts(text, max_chars)
+        new_files: list[str] = []
+        for pi, piece in enumerate(pieces):
+            suffix = "" if len(pieces) == 1 else f"_p{pi}"
+            out = clips_dir / f"clip_{turn_index + 1:04d}{suffix}.mp3"
+            tts.synthesize(piece, voice, out, language=job.request.language,
+                           speed=job.request.tts_speed or None,
+                           subtitle_enable=want_subtitles)
+            new_files.append(out.name)
+
+        clip_data["text"] = text
+        clip_data["voice_id"] = voice
+        clip_data["files"] = new_files
+        job._emit({"type": "review_data", "data": job.review_data.to_dict()})
+        job.log("info", f"Regenerated audio for turn {turn_index + 1}")
+
+    except Exception as exc:
+        raise HTTPException(500, f"Clip regeneration failed: {exc}") from exc
+
+    return {"ok": True, "clip": clip_data}
+
+
+@app.get("/api/jobs/{job_id}/slides")
+async def get_job_slides(job_id: str) -> dict[str, Any]:
+    """Get the slides for review."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return {"slides": job.review_data.slides}
+
+
+@app.get("/api/jobs/{job_id}/slides/{filename:path}")
+async def get_slide_file(job_id: str, filename: str) -> FileResponse:
+    """Serve a slide image file from the job workdir."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    slides_dir = Path(job.workdir) / "slides"
+    slide_path = slides_dir / filename
+    if not slide_path.exists() or not slide_path.is_file():
+        raise HTTPException(404, "Slide not found")
+    if not slide_path.resolve().is_relative_to(slides_dir.resolve()):
+        raise HTTPException(403, "Access denied")
+
+    media_type = "image/jpeg"
+    if slide_path.suffix.lower() == ".png":
+        media_type = "image/png"
+    elif slide_path.suffix.lower() == ".webp":
+        media_type = "image/webp"
+
+    return FileResponse(str(slide_path), media_type=media_type, filename=filename)
+
+
+@app.post("/api/jobs/{job_id}/slides/{slide_index}/regenerate")
+async def regenerate_slide(job_id: str, slide_index: int, request: Request) -> dict[str, Any]:
+    """Regenerate a specific slide with an updated prompt."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != "awaiting_slides_review":
+        raise HTTPException(400, "Job is not awaiting slides review")
+
+    payload = await request.json()
+    new_prompt = payload.get("prompt")
+    if not new_prompt:
+        raise HTTPException(400, "prompt is required")
+
+    slides = job.review_data.slides
+    slide_data = next((s for s in slides if s["index"] == slide_index), None)
+    if not slide_data:
+        raise HTTPException(404, f"Slide {slide_index} not found")
+
+    cfg = config_mod.load()
+    from podcaster import images as images_mod
+    from podcaster.slides import build_image_prompt
+
+    try:
+        image_client = images_mod.build_image_client(cfg)
+        slides_dir = Path(job.workdir) / "slides"
+        target = slides_dir / f"slide_{slide_index + 1:02d}.jpg"
+
+        result = image_client.generate(build_image_prompt(new_prompt), target)
+        slide_data["prompt"] = new_prompt
+        slide_data["image"] = str(result.path)
+        job._emit({"type": "review_data", "data": job.review_data.to_dict()})
+        job.log("info", f"Regenerated slide {slide_index + 1}")
+
+    except Exception as exc:
+        raise HTTPException(500, f"Slide regeneration failed: {exc}") from exc
+
+    return {"ok": True, "slide": slide_data}
 
 
 # --------------------------------------------------------------------------- #

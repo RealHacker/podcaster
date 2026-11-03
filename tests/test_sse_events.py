@@ -8,9 +8,12 @@ and the Jobs tab froze on "Job started" until the page was reloaded.
 The contract the front end relies on:
   * every event carries a monotonic ``seq``
   * a ``snapshot`` covers all events up to its own ``seq``
-  * a non-terminal status ("queued" / "running") is always emitted *before* the
-    terminal one ("done" / "error" / "cancelled"), so a client that only closes
-    on a terminal status keeps receiving progress updates for the whole run
+  * a non-terminal status ("queued" / "running" / "awaiting_*_review") is always
+    emitted *before* the terminal one ("done" / "error" / "cancelled"), so a
+    client that only closes on a terminal status keeps receiving progress
+    updates for the whole run
+  * review-waiting statuses (awaiting_script_review, awaiting_audio_review,
+    awaiting_slides_review) keep the stream open just like "running"
 """
 import json
 import sys
@@ -21,7 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-TERMINAL = ("done", "error", "cancelled")
+from podcaster.jobs import TERMINAL_STATUSES, REVIEW_STATUSES
+
+TERMINAL = TERMINAL_STATUSES
 
 failures: list[str] = []
 
@@ -162,11 +167,62 @@ def test_sse_endpoint_stream() -> None:
           "no log line is delivered twice")
 
 
+# --------------------------------------------------------------------------- #
+# 3. review statuses are not terminal
+# --------------------------------------------------------------------------- #
+
+def test_review_statuses_non_terminal() -> None:
+    """Review-waiting statuses must not be treated as terminal."""
+    check("awaiting_script_review" not in TERMINAL,
+          "awaiting_script_review is not terminal")
+    check("awaiting_audio_review" not in TERMINAL,
+          "awaiting_audio_review is not terminal")
+    check("awaiting_slides_review" not in TERMINAL,
+          "awaiting_slides_review is not terminal")
+    check("awaiting_script_review" in REVIEW_STATUSES,
+          "awaiting_script_review is a review status")
+    check("running" not in REVIEW_STATUSES,
+          "running is not a review status")
+
+
+def test_job_review_data() -> None:
+    """Jobs track review data correctly."""
+    from podcaster.jobs import Job, ReviewData
+    from podcaster.pipeline import PodcastRequest
+
+    job = Job(id="review", request=PodcastRequest(enable_review=True))
+    job.set_review_data(
+        script_title="Test Episode",
+        script_outline=["Intro", "Main", "Outro"],
+        script_turns=[{"index": 0, "speaker": "Host", "text": "Hello"}],
+    )
+
+    check(job.review_data.script_title == "Test Episode",
+          "script_title is set")
+    check(len(job.review_data.script_outline) == 3,
+          "script_outline is set")
+    check(len(job.review_data.script_turns) == 1,
+          "script_turns is set")
+
+    data = job.to_dict()
+    check("review_data" not in data or not data.get("review_data"),
+          "review_data not in dict when not in review status")
+
+    job.status = "awaiting_script_review"
+    data = job.to_dict()
+    check("review_data" in data and data["review_data"]["script_title"] == "Test Episode",
+          "review_data included when in review status")
+
+
 if __name__ == "__main__":
     print("=== job event contract")
     test_job_event_contract()
     print("\n=== SSE endpoint")
     test_sse_endpoint_stream()
+    print("\n=== review statuses")
+    test_review_statuses_non_terminal()
+    print("\n=== review data")
+    test_job_review_data()
     print()
     if failures:
         print(f"FAILED: {len(failures)} check(s)")

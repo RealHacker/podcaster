@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import re
 import shutil
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 from . import config as config_mod
 from . import images as images_mod
@@ -20,9 +22,12 @@ from . import subtitles as subtitles_mod
 from . import voices as voices_mod
 from .chunking import split_into_chunks
 from .llm import LLMClient
-from .script import Host, Script, generate_script
+from .script import Host, Script, Turn, generate_script, parse_turns
 from .sources import SourceDoc, fetch_url, load_local_file
 from .tts import build_tts, split_for_tts
+
+if TYPE_CHECKING:
+    from .jobs import Job
 
 Logger = Callable[[str, str], None]  # (level, message)
 
@@ -55,6 +60,7 @@ class PodcastRequest:
     keep_workdir: bool = True
     show_subtitles: bool = False
     show_slides: bool = False
+    enable_review: bool = False
 
 
 DEFAULT_NAMES_MALE = ["Marcus", "Daniel", "Alex", "Kenji", "Victor", "Sam"]
@@ -236,6 +242,26 @@ def _build_video_segments(
             if not any(slide.image for slide in plan):
                 log("warn", "No slide images could be generated — using the waveform layout.")
                 plan = []
+            # ---- Slides review gate --------------------------------------- #
+            elif req.enable_review and job is not None:
+                job.set_review_data(
+                    slides=[{
+                        "index": s.index,
+                        "title": s.title,
+                        "prompt": s.prompt,
+                        "image": str(s.image) if s.image else None,
+                        "turn_indexes": s.turn_indexes,
+                    } for s in plan]
+                )
+                if not job.wait_for_review("awaiting_slides_review"):
+                    raise PipelineError("Cancelled by the user.")
+                job.set_status("running")
+                on_step("Resuming after slides review", 0.92)
+                updated_slides = job.review_data.slides
+                if updated_slides:
+                    for i, slide_data in enumerate(updated_slides):
+                        if i < len(plan) and slide_data.get("image"):
+                            plan[i].image = Path(slide_data["image"])
         else:
             log("warn", "The slide planner returned nothing — using the waveform layout.")
 
@@ -279,6 +305,41 @@ def _build_video_segments(
     return segments, "slides"
 
 
+def _synthesize_turn(
+    turn_index: int,
+    turn: Turn,
+    voice: str,
+    tts: Any,
+    clips_dir: Path,
+    req: PodcastRequest,
+    max_chars: int,
+    want_subtitles: bool,
+) -> dict[str, Any]:
+    """Synthesize a single turn (may be called in parallel)."""
+    pieces = split_for_tts(turn.text, max_chars)
+    turn_clips: list[Path] = []
+    turn_subtitles: list[list[subtitles_mod.SubtitleCue]] = []
+    turn_sources: list[str] = []
+    for pi, piece in enumerate(pieces):
+        suffix = "" if len(pieces) == 1 else f"_p{pi}"
+        out = clips_dir / f"clip_{turn_index + 1:04d}{suffix}.mp3"
+        result = tts.synthesize(piece, voice, out, language=req.language,
+                                speed=req.tts_speed or None,
+                                subtitle_enable=want_subtitles)
+        turn_clips.append(out)
+        turn_subtitles.append(result.subtitles)
+        turn_sources.append(piece)
+    return {
+        "index": turn_index,
+        "speaker": turn.speaker,
+        "text": turn.text,
+        "voice_id": voice,
+        "files": [c.name for c in turn_clips],
+        "subtitles": turn_subtitles,
+        "sources": turn_sources,
+    }
+
+
 def run_pipeline(
     req: PodcastRequest,
     workdir: Path,
@@ -286,6 +347,7 @@ def run_pipeline(
     on_step: Callable[[str, float], None],
     log: Logger,
     should_cancel: Callable[[], bool] = lambda: False,
+    job: "Job | None" = None,
 ) -> dict[str, Any]:
     cfg = config_mod.load()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +398,32 @@ def run_pipeline(
     log("info", f"Script written: {len(script.turns)} turns, "
                 f"~{len(script.text):,} characters of dialogue")
 
+    # ---- Script review gate ----------------------------------------------- #
+    if req.enable_review and job is not None:
+        job.set_review_data(
+            script_title=script.title,
+            script_outline=list(script.outline),
+            script_turns=[{"index": t.index, "speaker": t.speaker, "text": t.text}
+                          for t in script.turns],
+            hosts=[h.to_dict() for h in hosts],
+        )
+        job.save_pipeline_state("script", {
+            "title": script.title,
+            "outline": script.outline,
+            "turns": [{"index": t.index, "speaker": t.speaker, "text": t.text, "segment": t.segment}
+                      for t in script.turns],
+        })
+        if not job.wait_for_review("awaiting_script_review"):
+            raise PipelineError("Cancelled by the user.")
+        job.set_status("running")
+        on_step("Resuming after script review", 0.60)
+        updated_turns = job.review_data.script_turns
+        if updated_turns:
+            script.turns = [Turn(speaker=t["speaker"], text=t["text"], index=t["index"])
+                            for t in updated_turns]
+            script.title = job.review_data.script_title or script.title
+            log("info", f"Script updated: {len(script.turns)} turns after review")
+
     # ---- 4. TTS ----------------------------------------------------------- #
     tts_cfg = dict(cfg)
     tts_cfg["tts_speed"] = req.tts_speed or cfg.get("tts_speed", 1.0)
@@ -348,42 +436,76 @@ def run_pipeline(
     voice_by_name = {h.name: h for h in hosts}
     max_chars = 4800 if "2.8" in (cfg.get("tts_model") or "") else 4000
     total = len(script.turns)
-    # Subtitles are only useful for the video, where they are burned into the
-    # picture below the waveform.
     want_subtitles = req.export_format == "video" and bool(req.show_subtitles)
 
-    for i, turn in enumerate(script.turns):
-        if should_cancel():
-            raise PipelineError("Cancelled by the user.")
-        on_step(f"Generating audio for turn {i + 1}/{total}", 0.6 + 0.25 * (i / max(1, total)))
-        host = voice_by_name.get(turn.speaker) or hosts[0]
-        voice = host.voice_id or hosts[0].voice_id
-        pieces = split_for_tts(turn.text, max_chars)
-        turn_clips: list[Path] = []
-        turn_subtitles: list[list[subtitles_mod.SubtitleCue]] = []
-        turn_sources: list[str] = []
-        for pi, piece in enumerate(pieces):
-            suffix = "" if len(pieces) == 1 else f"_p{pi}"
-            out = clips_dir / f"clip_{i + 1:04d}{suffix}.mp3"
-            result = tts.synthesize(piece, voice, out, language=req.language,
-                                    speed=req.tts_speed or None,
-                                    subtitle_enable=want_subtitles)
-            turn_clips.append(out)
-            turn_subtitles.append(result.subtitles)
-            turn_sources.append(piece)
-        clips.extend(turn_clips)
-        clip_records.append({
-            "index": i,
-            "speaker": turn.speaker,
-            "text": turn.text,
-            "voice_id": voice,
-            "files": [c.name for c in turn_clips],
-            "subtitles": turn_subtitles,
-            "sources": turn_sources,
-        })
+    use_parallel = cfg.get("tts_parallel", False)
+    parallel_workers = max(1, min(6, int(cfg.get("tts_parallel_workers", 2))))
+
+    if use_parallel and total > 1:
+        log("info", f"Using parallel TTS with {parallel_workers} workers")
+        on_step(f"Generating audio for {total} turns (parallel)", 0.60)
+        futures_map: dict[Any, int] = {}
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            for i, turn in enumerate(script.turns):
+                if should_cancel():
+                    raise PipelineError("Cancelled by the user.")
+                host = voice_by_name.get(turn.speaker) or hosts[0]
+                voice = host.voice_id or hosts[0].voice_id
+                future = executor.submit(
+                    _synthesize_turn, i, turn, voice, tts, clips_dir, req,
+                    max_chars, want_subtitles)
+                futures_map[future] = i
+
+            results_by_index: dict[int, dict[str, Any]] = {}
+            completed = 0
+            for future in as_completed(futures_map):
+                if should_cancel():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise PipelineError("Cancelled by the user.")
+                idx = futures_map[future]
+                try:
+                    result = future.result()
+                    results_by_index[idx] = result
+                except Exception as exc:
+                    raise PipelineError(f"TTS failed for turn {idx + 1}: {exc}") from exc
+                completed += 1
+                on_step(f"Generating audio ({completed}/{total})", 0.60 + 0.25 * (completed / total))
+
+        for i in range(total):
+            record = results_by_index[i]
+            clip_records.append(record)
+            for fname in record["files"]:
+                clips.append(clips_dir / fname)
+    else:
+        for i, turn in enumerate(script.turns):
+            if should_cancel():
+                raise PipelineError("Cancelled by the user.")
+            on_step(f"Generating audio for turn {i + 1}/{total}", 0.6 + 0.25 * (i / max(1, total)))
+            host = voice_by_name.get(turn.speaker) or hosts[0]
+            voice = host.voice_id or hosts[0].voice_id
+            record = _synthesize_turn(i, turn, voice, tts, clips_dir, req, max_chars, want_subtitles)
+            clips.extend(clips_dir / fname for fname in record["files"])
+            clip_records.append(record)
 
     if should_cancel():
         raise PipelineError("Cancelled by the user.")
+
+    # ---- Audio review gate ------------------------------------------------ #
+    if req.enable_review and job is not None:
+        job.set_review_data(
+            audio_clips=[{
+                "index": r["index"],
+                "speaker": r["speaker"],
+                "text": r["text"],
+                "voice_id": r["voice_id"],
+                "files": r["files"],
+            } for r in clip_records]
+        )
+        if not job.wait_for_review("awaiting_audio_review"):
+            raise PipelineError("Cancelled by the user.")
+        job.set_status("running")
+        on_step("Resuming after audio review", 0.86)
+        clips = [clips_dir / fname for r in clip_records for fname in r["files"]]
 
     # ---- 5. Merge audio --------------------------------------------------- #
     on_step("Merging the audio clips", 0.86)
