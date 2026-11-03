@@ -34,6 +34,9 @@ class ClipResult:
     subtitles: list[SubtitleCue] = field(default_factory=list)
 
 
+QWEN_MAX_CHARS = 600
+
+
 def split_for_tts(text: str, max_chars: int = 4000) -> list[str]:
     """Split a long turn into API-sized pieces on sentence boundaries."""
     text = (text or "").strip()
@@ -60,6 +63,13 @@ def split_for_tts(text: str, max_chars: int = 4000) -> list[str]:
     if buf:
         pieces.append(buf)
     return pieces
+
+
+def is_qwen_dialect(model: str, base_url: str) -> bool:
+    """Detect if using ModelVerse Qwen TTS which has a different API schema."""
+    model_lower = (model or "").lower()
+    url_lower = (base_url or "").lower()
+    return "qwen" in model_lower or "modelverse" in url_lower
 
 
 class _RateLimiter:
@@ -215,6 +225,7 @@ class OpenAICompatTTS:
         self.timeout = timeout
         self.voice_id = voice_id
         self.limiter = _RateLimiter(min_interval)
+        self._is_qwen = is_qwen_dialect(model, base_url)
 
     def _endpoint(self) -> str:
         base = self.base_url
@@ -224,23 +235,76 @@ class OpenAICompatTTS:
             return base
         return base + "/audio/speech"
 
-    def synthesize(self, text: str, voice_id: str, out_path: Path,
-                   language: str = "en", speed: float | None = None,
-                   subtitle_enable: bool = False,
-                   subtitle_type: str = "word") -> ClipResult:
-        # The OpenAI-compatible endpoint has no subtitle service, so the
-        # request is ignored and no cues are produced.
-        if not self.api_key:
-            raise TTSError("TTS API key is not configured")
-        payload = {
+    def _build_payload(self, text: str, voice_id: str, language: str,
+                       speed: float | None) -> dict[str, Any]:
+        """Build request payload based on dialect (Qwen vs standard OpenAI)."""
+        if self._is_qwen:
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "input": text,
+                "voice": voice_id or self.voice_id,
+            }
+            lang_map = {"en": "English", "zh": "Chinese"}
+            lang_type = lang_map.get(language, "Auto")
+            payload["metadata"] = {"language_type": lang_type}
+            return payload
+        return {
             "model": self.model,
             "voice": voice_id or self.voice_id,
             "input": text,
             "speed": speed if speed is not None else self.speed,
             "response_format": "mp3",
         }
+
+    def _handle_response(self, response: httpx.Response, out_path: Path) -> ClipResult:
+        """Handle response: binary audio (standard OpenAI) or JSON+URL (Qwen)."""
+        content_type = response.headers.get("content-type", "").lower()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self._is_qwen or "application/json" in content_type:
+            try:
+                data = response.json()
+            except Exception as exc:
+                raise TTSError(f"Expected JSON response but got invalid data: {exc}") from exc
+
+            audio_url = (data.get("output") or {}).get("audio", {}).get("url")
+            if not audio_url:
+                raise TTSError(f"Qwen TTS response missing output.audio.url: {data}")
+
+            try:
+                with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+                    audio_resp = client.get(audio_url)
+                audio_resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise TTSError(f"Failed to download Qwen audio from URL: {exc}") from exc
+
+            audio_bytes = audio_resp.content
+            audio_type = audio_resp.headers.get("content-type", "").lower()
+            fmt = "wav" if "wav" in audio_type else "mp3"
+            actual_path = out_path.with_suffix(f".{fmt}")
+            actual_path.write_bytes(audio_bytes)
+            return ClipResult(path=actual_path, chars=len(audio_bytes), format=fmt)
+
+        out_path.write_bytes(response.content)
+        return ClipResult(path=out_path, chars=len(response.content), format="mp3")
+
+    def max_chars(self) -> int:
+        """Return the maximum characters per request for this dialect."""
+        return QWEN_MAX_CHARS if self._is_qwen else 4000
+
+    def synthesize(self, text: str, voice_id: str, out_path: Path,
+                   language: str = "en", speed: float | None = None,
+                   subtitle_enable: bool = False,
+                   subtitle_type: str = "word") -> ClipResult:
+        if not self.api_key:
+            raise TTSError("TTS API key is not configured")
+        if not text.strip():
+            raise TTSError("Cannot synthesize empty text")
+
+        payload = self._build_payload(text, voice_id, language, speed)
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         last_error: Exception | None = None
+
         for attempt in range(4):
             self.limiter.wait()
             try:
@@ -257,9 +321,9 @@ class OpenAICompatTTS:
                     time.sleep(min(3 * (attempt + 1), 30))
                     continue
                 raise TTSError(f"TTS HTTP {response.status_code}: {detail}")
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(response.content)
-            return ClipResult(path=out_path, chars=len(text), format="mp3")
+
+            return self._handle_response(response, out_path)
+
         raise TTSError(f"TTS request failed after retries: {last_error}")
 
 

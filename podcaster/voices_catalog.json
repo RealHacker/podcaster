@@ -142,5 +142,41 @@
     "tone": "poetic, gentle",
     "native": "zh",
     "verified": true
+  },
+  {
+    "id": "Cherry",
+    "label": "Cherry (Qwen)",
+    "gender": "female",
+    "tone": "warm, expressive",
+    "native": "zh",
+    "provider": "qwen",
+    "verified": true
+  },
+  {
+    "id": "Ethan",
+    "label": "Ethan (Qwen)",
+    "gender": "male",
+    "tone": "confident, clear",
+    "native": "zh",
+    "provider": "qwen",
+    "verified": true
+  },
+  {
+    "id": "Serena",
+    "label": "Serena (Qwen)",
+    "gender": "female",
+    "tone": "calm, professional",
+    "native": "zh",
+    "provider": "qwen",
+    "verified": true
+  },
+  {
+    "id": "Chelsie",
+    "label": "Chelsie (Qwen)",
+    "gender": "female",
+    "tone": "friendly, upbeat",
+    "native": "zh",
+    "provider": "qwen",
+    "verified": true
   }
 ]
