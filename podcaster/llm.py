@@ -1,7 +1,7 @@
 """A small OpenAI-compatible chat client.
 
 Works with any endpoint that speaks ``POST {base}/chat/completions`` —
-MiniMax, OpenAI, DeepSeek, vLLM, Ollama's compat mode, etc.
+MiniMax, OpenAI, DeepSeek, vLLM, Ollama's compat mode, ModelVerse, etc.
 """
 from __future__ import annotations
 
@@ -29,17 +29,101 @@ def strip_reasoning(text: str) -> str:
     return cleaned.strip()
 
 
+def _extract_content_from_parts(parts: list) -> str:
+    """Extract text from OpenAI-style content parts list."""
+    texts = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            texts.append(part.get("text", ""))
+        elif "text" in part:
+            texts.append(part.get("text", ""))
+    return "".join(texts)
+
+
+def _build_debug_context(payload: dict[str, Any]) -> str:
+    """Build a debug string with non-sensitive response metadata."""
+    ctx_parts = []
+    choices = payload.get("choices") or []
+    if choices:
+        choice = choices[0]
+        if "finish_reason" in choice:
+            ctx_parts.append(f"finish_reason={choice['finish_reason']}")
+        message = choice.get("message") or {}
+        present_fields = [k for k in message.keys() if message.get(k) is not None]
+        if present_fields:
+            ctx_parts.append(f"message_fields={present_fields}")
+    if "usage" in payload:
+        usage = payload["usage"]
+        ctx_parts.append(f"usage={{prompt={usage.get('prompt_tokens')}, "
+                         f"completion={usage.get('completion_tokens')}}}")
+    if "model" in payload:
+        ctx_parts.append(f"model={payload['model']}")
+    return "; ".join(ctx_parts) if ctx_parts else "no metadata"
+
+
+def _extract_reasoning_details(details: list) -> str:
+    """Extract text from reasoning_details array (structured thinking fragments)."""
+    if not details or not isinstance(details, list):
+        return ""
+    texts = []
+    for item in details:
+        if isinstance(item, str):
+            texts.append(item)
+        elif isinstance(item, dict):
+            for key in ("text", "content", "value"):
+                if key in item and isinstance(item[key], str):
+                    texts.append(item[key])
+                    break
+    return " ".join(texts)
+
+
 def _extract_text(payload: dict[str, Any]) -> str:
+    """Extract response text from an OpenAI-compatible chat completion.
+    
+    Handles standard content, content parts lists, and reasoning fields
+    from reasoning models (DeepSeek-R1, Qwen thinking variants, ModelVerse, etc.).
+    
+    Field priority:
+    1. message.content (string or parts list)
+    2. choices[].text (legacy)
+    3. message.reasoning_content
+    4. message.reasoning
+    5. message.reasoning_details (array of fragments)
+    """
     choices = payload.get("choices") or []
     if not choices:
         raise LLMError(f"LLM returned no choices: {json.dumps(payload)[:400]}")
-    message = choices[0].get("message") or {}
+    
+    choice = choices[0]
+    message = choice.get("message") or {}
+    
     content = message.get("content")
     if content is None:
-        content = choices[0].get("text") or ""
-    if isinstance(content, list):  # some gateways return content parts
-        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    return (content or "").strip()
+        content = choice.get("text") or ""
+    
+    if isinstance(content, list):
+        content = _extract_content_from_parts(content)
+    
+    content = (content or "").strip()
+    
+    if not content:
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content and isinstance(reasoning_content, str):
+            content = reasoning_content.strip()
+    
+    if not content:
+        reasoning = message.get("reasoning")
+        if reasoning and isinstance(reasoning, str):
+            content = reasoning.strip()
+    
+    if not content:
+        reasoning_details = message.get("reasoning_details")
+        if reasoning_details:
+            content = _extract_reasoning_details(reasoning_details).strip()
+    
+    return content
 
 
 class LLMClient:
@@ -64,11 +148,13 @@ class LLMClient:
              max_tokens: int | None = None, retries: int = 4) -> str:
         if not self.api_key:
             raise LLMError("LLM API key is not configured")
+        effective_max = max_tokens or self.max_tokens
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": max_tokens or self.max_tokens,
+            "max_tokens": effective_max,
+            "max_completion_tokens": effective_max,
             "stream": False,
         }
         headers = {
@@ -99,9 +185,14 @@ class LLMClient:
             except json.JSONDecodeError as exc:
                 raise LLMError(f"LLM returned invalid JSON: {exc}") from exc
 
-            text = strip_reasoning(_extract_text(data))
+            raw_text = _extract_text(data)
+            text = strip_reasoning(raw_text)
             if not text:
-                last_error = LLMError("LLM returned an empty response")
+                debug_ctx = _build_debug_context(data)
+                last_error = LLMError(
+                    f"LLM returned an empty response after extraction "
+                    f"(raw_len={len(raw_text)}, {debug_ctx})"
+                )
                 time.sleep(1.5)
                 continue
             return text
