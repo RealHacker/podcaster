@@ -518,6 +518,13 @@
         content.appendChild(row);
       });
 
+      content.querySelectorAll(".review-turn-delete").forEach(btn => {
+        btn.onclick = () => {
+          const row = btn.closest(".review-turn");
+          if (row) row.remove();
+        };
+      });
+
       const notes = document.createElement("div");
       notes.className = "review-notes";
       notes.innerHTML = `
