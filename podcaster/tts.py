@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from .subtitles import SubtitleCue, parse_subtitle_payload
+from .subtitles import SubtitleCue, generate_approximate_cues, parse_subtitle_payload
 
 
 class TTSError(RuntimeError):
@@ -70,6 +70,27 @@ def is_qwen_dialect(model: str, base_url: str) -> bool:
     model_lower = (model or "").lower()
     url_lower = (base_url or "").lower()
     return "qwen" in model_lower or "modelverse" in url_lower
+
+
+def _probe_duration_ms(path: Path) -> float:
+    """Probe audio file duration in milliseconds using ffprobe."""
+    import shutil
+    import subprocess
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0.0
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip()) * 1000.0
+    except Exception:
+        pass
+    return 0.0
 
 
 def _convert_wav_to_mp3(wav_bytes: bytes, out_path: Path) -> Path:
@@ -371,7 +392,14 @@ class OpenAICompatTTS:
                     continue
                 raise TTSError(f"TTS HTTP {response.status_code}: {detail}")
 
-            return self._handle_response(response, out_path, source_text=text)
+            result = self._handle_response(response, out_path, source_text=text)
+
+            if subtitle_enable and not result.subtitles:
+                duration_ms = _probe_duration_ms(result.path)
+                if duration_ms > 0:
+                    result.subtitles = generate_approximate_cues(text, duration_ms)
+
+            return result
 
         raise TTSError(f"TTS request failed after retries: {last_error}")
 

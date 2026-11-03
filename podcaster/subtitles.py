@@ -378,3 +378,100 @@ def to_srt(lines: Iterable[SubtitleLine]) -> str:
         out.append(line.text)
         out.append("")
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Approximate cue generation (fallback for providers without timed cues)
+# --------------------------------------------------------------------------- #
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?。！？；])\s*")
+_CLAUSE_SPLIT = re.compile(r"(?<=[,;:，；：、])\s*")
+
+MAX_CHUNK_WIDTH = 50
+
+
+def _split_into_chunks(text: str, max_width: int = MAX_CHUNK_WIDTH) -> list[str]:
+    """Split text into caption-sized chunks on sentence/clause boundaries.
+
+    Prefers sentence boundaries but falls back to clause boundaries for long
+    sentences.  Very long runs without punctuation are split mid-text.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    sentences = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+    if not sentences:
+        sentences = [text]
+
+    chunks: list[str] = []
+    for sentence in sentences:
+        if text_width(sentence) <= max_width:
+            chunks.append(sentence)
+            continue
+        clauses = [c.strip() for c in _CLAUSE_SPLIT.split(sentence) if c.strip()]
+        if not clauses:
+            clauses = [sentence]
+        buf = ""
+        for clause in clauses:
+            if text_width(clause) > max_width:
+                if buf:
+                    chunks.append(buf)
+                    buf = ""
+                pos = 0
+                while pos < len(clause):
+                    piece_chars: list[str] = []
+                    piece_width = 0
+                    while pos < len(clause) and piece_width < max_width:
+                        ch = clause[pos]
+                        ch_w = 2 if is_wide(ch) else 1
+                        if piece_width + ch_w > max_width and piece_chars:
+                            break
+                        piece_chars.append(ch)
+                        piece_width += ch_w
+                        pos += 1
+                    if piece_chars:
+                        chunks.append("".join(piece_chars))
+                continue
+            candidate = f"{buf} {clause}".strip() if buf else clause
+            if text_width(candidate) <= max_width:
+                buf = candidate
+            else:
+                if buf:
+                    chunks.append(buf)
+                buf = clause
+        if buf:
+            chunks.append(buf)
+
+    return chunks
+
+
+def generate_approximate_cues(
+    source_text: str, duration_ms: float
+) -> list[SubtitleCue]:
+    """Generate approximate subtitle cues when the TTS provider returns none.
+
+    Splits the source text into caption-sized chunks and distributes them
+    proportionally across the audio duration based on text width.
+    """
+    chunks = _split_into_chunks(source_text)
+    if not chunks or duration_ms <= 0:
+        return []
+
+    total_width = sum(text_width(c) for c in chunks)
+    if total_width == 0:
+        return []
+
+    cues: list[SubtitleCue] = []
+    elapsed = 0.0
+    for chunk in chunks:
+        chunk_width = text_width(chunk)
+        chunk_duration = duration_ms * (chunk_width / total_width)
+        cues.append(SubtitleCue(
+            text=chunk,
+            begin_ms=elapsed,
+            end_ms=elapsed + chunk_duration,
+        ))
+        elapsed += chunk_duration
+
+    return cues

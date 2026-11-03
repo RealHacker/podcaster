@@ -11,6 +11,7 @@ from podcaster.subtitles import (  # noqa: E402
     SubtitleCue,
     build_lines,
     clean_caption_text,
+    generate_approximate_cues,
     parse_subtitle_payload,
     text_width,
     to_srt,
@@ -140,6 +141,69 @@ def test_srt() -> None:
     check("00:00:00,000 --> 00:00:01,500" in srt, "the SRT timestamp is formatted")
 
 
+# --- Approximate cue generation tests ---
+
+def test_approximate_cues_basic() -> None:
+    text = "Hello world. This is a test."
+    duration = 4000.0  # 4 seconds
+    cues = generate_approximate_cues(text, duration)
+    check(len(cues) >= 1, f"approximate cues are generated ({len(cues)})")
+    check(cues[0].begin_ms == 0.0, "first cue starts at 0")
+    check(abs(cues[-1].end_ms - duration) < 1.0, f"last cue ends near duration ({cues[-1].end_ms})")
+    joined = "".join(c.text for c in cues)
+    check("Hello" in joined and "test" in joined, "all words appear in cues")
+
+
+def test_approximate_cues_empty() -> None:
+    check(generate_approximate_cues("", 5000.0) == [], "empty text yields no cues")
+    check(generate_approximate_cues("Hello", 0.0) == [], "zero duration yields no cues")
+    check(generate_approximate_cues("", 0.0) == [], "empty text and zero duration yields no cues")
+
+
+def test_approximate_cues_proportional() -> None:
+    text = "Short. This is a much longer sentence that should take more time."
+    duration = 10000.0
+    cues = generate_approximate_cues(text, duration)
+    check(len(cues) >= 2, f"multiple sentences yield multiple cues ({len(cues)})")
+    first_duration = cues[0].end_ms - cues[0].begin_ms
+    total_first_text_width = text_width(cues[0].text)
+    total_text_width = sum(text_width(c.text) for c in cues)
+    expected_ratio = total_first_text_width / total_text_width
+    actual_ratio = first_duration / duration
+    check(abs(expected_ratio - actual_ratio) < 0.01,
+          f"time is proportional to text width ({expected_ratio:.3f} vs {actual_ratio:.3f})")
+
+
+def test_approximate_cues_cjk() -> None:
+    text = "你好世界。这是一个测试。"
+    duration = 5000.0
+    cues = generate_approximate_cues(text, duration)
+    check(len(cues) >= 1, f"CJK text yields cues ({len(cues)})")
+    joined = "".join(c.text for c in cues)
+    check("你好" in joined, "CJK characters preserved in cues")
+
+
+def test_approximate_cues_long_text() -> None:
+    text = ("Ambient computing is the idea that the room around you quietly "
+            "reacts to what you are doing without ever asking for your attention. "
+            "The lights dim when you start a movie, the thermostat adjusts when you leave.")
+    duration = 15000.0
+    cues = generate_approximate_cues(text, duration)
+    check(len(cues) >= 2, f"long text splits into multiple cues ({len(cues)})")
+    for cue in cues:
+        check(text_width(cue.text) <= 64, f"each cue fits caption width ({text_width(cue.text)})")
+
+
+def test_approximate_cues_continuous_timing() -> None:
+    text = "First sentence. Second sentence. Third sentence."
+    duration = 6000.0
+    cues = generate_approximate_cues(text, duration)
+    check(len(cues) >= 2, f"multiple cues generated ({len(cues)})")
+    for i in range(1, len(cues)):
+        check(abs(cues[i].begin_ms - cues[i-1].end_ms) < 0.1,
+              f"cue {i} begins where cue {i-1} ends ({cues[i].begin_ms} vs {cues[i-1].end_ms})")
+
+
 if __name__ == "__main__":
     print("=== width")
     test_width()
@@ -156,6 +220,13 @@ if __name__ == "__main__":
     print("\n=== text helpers")
     test_clean_text()
     test_srt()
+    print("\n=== approximate cue generation")
+    test_approximate_cues_basic()
+    test_approximate_cues_empty()
+    test_approximate_cues_proportional()
+    test_approximate_cues_cjk()
+    test_approximate_cues_long_text()
+    test_approximate_cues_continuous_timing()
     print()
     if failures:
         print(f"FAILED: {len(failures)} check(s)")
