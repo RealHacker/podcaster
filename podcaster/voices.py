@@ -86,7 +86,14 @@ _LANG_HINTS = {
 }
 
 
-def load_catalog() -> list[dict[str, Any]]:
+def load_catalog(is_qwen: bool = False) -> list[dict[str, Any]]:
+    """Load the voice catalog.
+
+    When ``is_qwen`` is True, returns only ModelVerse Qwen TTS-compatible
+    voices (Cherry, Ethan, etc.). Otherwise returns the MiniMax catalog.
+    """
+    if is_qwen:
+        return [dict(v) for v in QWEN_VOICES]
     if CATALOG_PATH.exists():
         try:
             data = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
@@ -101,13 +108,18 @@ def save_catalog(voices: list[dict[str, Any]]) -> None:
     CATALOG_PATH.write_text(json.dumps(voices, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def list_voices(language: str | None = None, gender: str | None = None) -> list[dict[str, Any]]:
-    voices = load_catalog()
+def list_voices(language: str | None = None, gender: str | None = None,
+                is_qwen: bool = False) -> list[dict[str, Any]]:
+    """List available voices, optionally filtered by language and gender.
+
+    When ``is_qwen`` is True, returns only Qwen TTS-compatible voices.
+    """
+    voices = load_catalog(is_qwen=is_qwen)
     out = []
     for voice in voices:
         if gender and voice.get("gender") != gender:
             continue
-        if language:
+        if language and not is_qwen:
             hints = _LANG_HINTS.get(language, ())
             blob = f"{voice.get('id', '')} {voice.get('label', '')}".lower()
             if not any(h in blob for h in hints):
@@ -117,18 +129,25 @@ def list_voices(language: str | None = None, gender: str | None = None) -> list[
 
 
 def assign_voices(hosts: list, language: str = "en",
-                  overrides: dict[str, str] | None = None) -> list[str]:
+                  overrides: dict[str, str] | None = None,
+                  is_qwen: bool = False) -> list[str]:
     """Pick a distinct voice per host, respecting the requested gender.
 
     ``overrides`` maps a host name to an explicit voice id.
+
+    When ``is_qwen`` is True, only Qwen TTS-compatible voices (Cherry, Ethan,
+    Serena, Chelsie) are used. These voices are required for ModelVerse Qwen
+    TTS, which rejects MiniMax voice IDs.
     """
     overrides = overrides or {}
-    catalog = load_catalog()
+    catalog = load_catalog(is_qwen=is_qwen)
     used: set[str] = set()
     assigned: list[str] = []
 
     def candidates(gender: str) -> list[dict[str, Any]]:
         preferred = [v for v in catalog if v.get("gender") == gender]
+        if is_qwen:
+            return preferred
         if language == "zh":
             hints = ("male-qn", "female-", "chinese (mandarin)")
         else:

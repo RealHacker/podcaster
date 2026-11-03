@@ -120,7 +120,10 @@ async def test_config(request: Request) -> dict[str, Any]:
 
 @app.get("/api/voices")
 async def get_voices(language: str | None = None, gender: str | None = None) -> dict[str, Any]:
-    return {"voices": voices_mod.list_voices(language, gender)}
+    from podcaster.tts import is_qwen_dialect
+    cfg = config_mod.load()
+    is_qwen = is_qwen_dialect(cfg.get("tts_model", ""), cfg.get("tts_base_url", ""))
+    return {"voices": voices_mod.list_voices(language, gender, is_qwen=is_qwen)}
 
 
 @app.post("/api/voices/verify")
@@ -343,7 +346,7 @@ async def regenerate_job_script(job_id: str, request: Request) -> dict[str, Any]
     try:
         doc = resolve_source(job.request)
         chunks = split_into_chunks(doc.text, job.request.chunk_chars or 6000)
-        hosts = build_hosts(job.request)
+        hosts = build_hosts(job.request, cfg)
 
         client = LLMClient(
             base_url=cfg.get("llm_base_url", ""),
@@ -454,7 +457,7 @@ async def regenerate_clip(job_id: str, turn_index: int, request: Request) -> dic
 
         text = new_text if new_text else clip_data["text"]
         voice = new_voice_id if new_voice_id else clip_data["voice_id"]
-        max_chars = 4800 if "2.8" in (cfg.get("tts_model") or "") else 4000
+        max_chars = getattr(tts, "max_chars", lambda: 4000)()
         want_subtitles = job.request.export_format == "video" and job.request.show_subtitles
 
         clips_dir = Path(job.workdir) / "clips"
