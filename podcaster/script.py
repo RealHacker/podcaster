@@ -138,6 +138,8 @@ def _format_rule(language: str) -> str:
             "2. 说话人姓名必须且只能是下面给出的名字之一，原样使用，不要加编号、括号、角色说明\n"
             "3. 不要输出任何 markdown 标题、列表、括号里的舞台提示、旁白说明或空行\n"
             "4. 不要重复人名，不要写“主持人：”这种通用称谓\n"
+            "5. 不要输出任何字数统计、规划备注、计数表达式或草稿痕迹\n"
+            "6. 每个观点只说一次——不要换种说法重复已经讲过的内容\n"
         )
     return (
         "Strict output format:\n"
@@ -148,7 +150,8 @@ def _format_rule(language: str) -> str:
         "lines, no labels like 'Host:'\n"
         "4. Never repeat the name inside the dialogue text\n"
         "5. No word counts, counting, planning notes, or meta-commentary in dialogue "
-        "(e.g. no '= 30 words', 'need more', 'Total 124', numbered-word drafts)\n"
+        "(e.g. no '= 30 words', 'need more', 'Total 124', 'Count add', numbered-word drafts)\n"
+        "6. State each point only once — do not paraphrase or restate content already covered\n"
     )
 
 
@@ -226,6 +229,15 @@ _META_PLANNING = re.compile(
     re.I
 )
 
+# Pattern: short planning crumbs (e.g. "Count add.", "Add more.")
+_PLANNING_CRUMB = re.compile(
+    r"\b(?:Count\s+add|Add\s+more|Check\s+this)\.?",
+    re.I
+)
+
+# Pattern: stray digit prefix mid-line (e.g. "17 So" at beginning of truncated text)
+_STRAY_DIGIT_PREFIX = re.compile(r"^\d{1,3}\s+[A-Z][a-z]{0,3}$")
+
 
 def _is_planning_line(text: str) -> bool:
     """Return True if the line is primarily planning/meta text, not dialogue."""
@@ -255,14 +267,80 @@ def _clean_dialogue_text(text: str) -> str:
     - Word count suffixes: "= 30ish.", "= 22", "=20"
     - Line number prefixes from dumps: "10|"
     - Numbered-word suffixes: "What's(1) the2 practical3..." at end of line
+    - Planning crumbs: "Count add.", "Add more."
     """
     if not text:
         return ""
     text = _LINE_NUMBER_PREFIX.sub("", text)
     text = _WORD_COUNT_SUFFIX.sub("", text)
     text = _NUMBERED_SUFFIX.sub("", text)
+    text = _PLANNING_CRUMB.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text)
     text = text.strip()
     return text
+
+
+def _is_truncated_line(text: str) -> bool:
+    """Return True if the line appears truncated or incomplete."""
+    if not text:
+        return False
+    if _STRAY_DIGIT_PREFIX.match(text):
+        return True
+    if len(text) < 6 and not text.endswith((".", "!", "?", "。", "！", "？")):
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Near-duplicate detection
+# --------------------------------------------------------------------------- #
+
+def _text_similarity(a: str, b: str) -> float:
+    """Compute a simple word-based Jaccard similarity between two strings."""
+    if not a or not b:
+        return 0.0
+    words_a = set(re.findall(r"\w+", a.lower()))
+    words_b = set(re.findall(r"\w+", b.lower()))
+    if not words_a or not words_b:
+        return 0.0
+    intersection = len(words_a & words_b)
+    union = len(words_a | words_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _remove_near_duplicates(turns: list, similarity_threshold: float = 0.75) -> list:
+    """Remove near-duplicate turns (same speaker with highly similar text).
+
+    Scans for pairs of turns by the same speaker where the text is very similar,
+    keeping the first occurrence. Also detects repeated Q→A blocks.
+    """
+    if len(turns) < 2:
+        return turns
+
+    result: list = []
+    seen_texts: dict[str, list[str]] = {}
+
+    for turn in turns:
+        speaker = turn.speaker
+        text = turn.text
+
+        if speaker not in seen_texts:
+            seen_texts[speaker] = []
+            result.append(turn)
+            seen_texts[speaker].append(text)
+            continue
+
+        is_near_dup = False
+        for prev_text in seen_texts[speaker]:
+            if _text_similarity(text, prev_text) >= similarity_threshold:
+                is_near_dup = True
+                break
+
+        if not is_near_dup:
+            result.append(turn)
+            seen_texts[speaker].append(text)
+
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +384,9 @@ def parse_turns(raw: str, hosts: list[Host], segment: int = 0) -> list[Turn]:
         if not text:
             continue
 
+        if _is_truncated_line(text):
+            continue
+
         # Resolve to the canonical host *name* (a string), never the Host object.
         resolved = (exact.get(name)
                     or lowered.get(name.lower())
@@ -328,9 +409,13 @@ def parse_turns(raw: str, hosts: list[Host], segment: int = 0) -> list[Turn]:
             merged[-1].text = f"{merged[-1].text} {turn.text}".strip()
         else:
             merged.append(turn)
-    for i, turn in enumerate(merged):
+
+    # Remove near-duplicate exchanges (same speaker + highly similar text).
+    deduplicated = _remove_near_duplicates(merged)
+
+    for i, turn in enumerate(deduplicated):
         turn.index = i
-    return merged
+    return deduplicated
 
 
 # --------------------------------------------------------------------------- #
@@ -401,6 +486,7 @@ def generate_script(
     per_segment_units = max(40, int(segment_budget * 0.88 / len(segments)))
     turns: list[Turn] = []
 
+    covered_outlines: list[str] = []
     for idx, (chunk, outline_line) in enumerate(segments):
         report(f"Writing segment {idx + 1}/{len(segments)}", 0.1 + 0.65 * (idx / max(1, len(segments))))
         prompt = _segment_prompt(
@@ -408,13 +494,16 @@ def generate_script(
             outline_line=outline_line, chunk_text=chunk.text,
             unit_target=per_segment_units, segment_index=idx,
             total_segments=len(segments), title=title_hint or script.title,
-            extra=extra_instructions, role_hint=_role_hint(style, hosts, language))
+            extra=extra_instructions, role_hint=_role_hint(style, hosts, language),
+            prior_covered=covered_outlines if idx > 0 else None)
         raw = client.chat(
             [{"role": "system", "content": "You write broadcast-ready podcast dialogue."},
              {"role": "user", "content": prompt}],
             temperature=0.85, max_tokens=min(6000, int(per_segment_units * 3) + 600))
         parsed = parse_turns(raw, hosts, segment=idx)
         turns.extend(parsed)
+        if outline_line not in covered_outlines:
+            covered_outlines.append(outline_line)
 
     # ---- 3. Intro / outro ------------------------------------------------- #
     report("Adding intro and outro", 0.78)
@@ -582,8 +671,29 @@ def _plan_prompt(language, style_desc, hosts, condensed, n_segments, total_units
     )
 
 
+def _prior_context_block(prior_covered: list[str], language: str) -> str:
+    """Build a block summarizing previously-covered outline points."""
+    if not prior_covered:
+        return ""
+    bullet_list = "\n".join(f"- {line}" for line in prior_covered)
+    if language == "zh":
+        return (
+            "【已讲过的内容——请勿重复】\n"
+            f"{bullet_list}\n\n"
+            "以上内容已经讲过。本段必须推进到新内容，不要换种说法重述。\n\n"
+        )
+    return (
+        "ALREADY COVERED (do not repeat):\n"
+        f"{bullet_list}\n\n"
+        "The points above were covered in prior segments. This segment must advance "
+        "to new material only — do not restate or paraphrase the same ideas.\n\n"
+    )
+
+
 def _segment_prompt(language, style_desc, hosts, outline_line, chunk_text, unit_target,
-                    segment_index, total_segments, title, extra, role_hint) -> str:
+                    segment_index, total_segments, title, extra, role_hint,
+                    prior_covered: list[str] | None = None) -> str:
+    prior_block = _prior_context_block(prior_covered or [], language)
     if language == "zh":
         return (
             f"你在写播客第 {segment_index + 1}/{total_segments} 段的台词。\n\n"
@@ -593,6 +703,7 @@ def _segment_prompt(language, style_desc, hosts, outline_line, chunk_text, unit_
             f"本段目标：约 {unit_target} 字\n"
             + (role_hint + "\n" if role_hint else "")
             + _host_block(hosts, language)
+            + prior_block
             + _format_rule(language)
             + ("额外要求：" + extra + "\n" if extra else "")
             + "\n【本段素材】\n" + chunk_text + "\n\n"
@@ -606,6 +717,7 @@ def _segment_prompt(language, style_desc, hosts, outline_line, chunk_text, unit_
         f"TARGET FOR THIS SEGMENT: about {unit_target} words\n"
         + (role_hint + "\n" if role_hint else "")
         + _host_block(hosts, language)
+        + prior_block
         + _format_rule(language)
         + (f"EXTRA REQUIREMENTS: {extra}\n" if extra else "")
         + "\nSOURCE MATERIAL FOR THIS SEGMENT:\n" + chunk_text + "\n\n"
