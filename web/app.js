@@ -5,6 +5,47 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+  /* ------------------------------------------------------------------ */
+  /* theme management                                                    */
+  /* ------------------------------------------------------------------ */
+
+  const THEME_KEY = "podcaster-theme";
+
+  const getSystemTheme = () =>
+    window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+
+  const getSavedTheme = () => localStorage.getItem(THEME_KEY);
+
+  const setTheme = (theme) => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem(THEME_KEY, theme);
+    updateThemeIcon(theme);
+  };
+
+  const updateThemeIcon = (theme) => {
+    const icon = $("#themeIcon");
+    if (icon) icon.textContent = theme === "dark" ? "🌙" : "☀️";
+  };
+
+  const initTheme = () => {
+    const saved = getSavedTheme();
+    const theme = saved || getSystemTheme();
+    setTheme(theme);
+
+    $("#themeToggle")?.addEventListener("click", () => {
+      const current = document.documentElement.getAttribute("data-theme") || "dark";
+      setTheme(current === "dark" ? "light" : "dark");
+    });
+
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+      if (!getSavedTheme()) {
+        setTheme(e.matches ? "dark" : "light");
+      }
+    });
+  };
+
+  initTheme();
+
   const state = {
     voices: [],
     styles: [],
