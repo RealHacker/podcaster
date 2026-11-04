@@ -147,6 +147,8 @@ def _format_rule(language: str) -> str:
         "3. No markdown headings, no lists, no stage directions in brackets, no blank "
         "lines, no labels like 'Host:'\n"
         "4. Never repeat the name inside the dialogue text\n"
+        "5. No word counts, counting, planning notes, or meta-commentary in dialogue "
+        "(e.g. no '= 30 words', 'need more', 'Total 124', numbered-word drafts)\n"
     )
 
 
@@ -179,6 +181,91 @@ def _units_target(total_units: int, language: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Planning / word-count artifact cleaning
+# --------------------------------------------------------------------------- #
+
+# Pattern: word count annotations at end of line, e.g. "= 30", "= 22ish.", "=20"
+_WORD_COUNT_SUFFIX = re.compile(r"\s*=\s*\d+(?:ish)?\.?\s*$", re.I)
+
+# Pattern: arithmetic / counting expressions, e.g. "Total 6+18+10+55+25=114. About target"
+_COUNTING_EXPR = re.compile(
+    r"(?:^|\s)(?:Total\s+)?\d+(?:\s*[+\-*/]\s*\d+)+\s*=\s*\d+|"
+    r"(?:Need\s+)?(?:total|target)\s+(?:about\s+)?\d+|"
+    r"About\s+target|"
+    r"Let'?s\s+count\s+carefully|"
+    r"That'?s\s+\d+\??",
+    re.I
+)
+
+# Pattern: numbered-word drafts, e.g. "What's(1) the2 practical3" or "word1 word2 word3"
+_NUMBERED_WORDS = re.compile(
+    r"[\w']+\(\d+\)\s+\w+\d+|"  # word(1) word2, allowing apostrophe
+    r"(?:\b[A-Za-z][A-Za-z\-_]*\d+\b\s*){3,}",  # word1 word2 word3 (at least 3, with hyphens)
+    re.I
+)
+
+# Pattern: line number prefix from source dumps, e.g. "    10|Sofia:" or "20|Marcus:"
+_LINE_NUMBER_PREFIX = re.compile(r"^\s*\d+\s*\|\s*")
+
+# Pattern: meta planning instructions that should never appear in dialogue
+_META_PLANNING = re.compile(
+    r"(?:^|\s)(?:"
+    r"Need\s+(?:maybe\s+)?(?:add\s+more|target|total)|"
+    r"Then\s+\w+\s+answer\s+with|"
+    r"Should\s+be\s+okay|"
+    r"Could\s+(?:add|include|be)|"
+    r"(?:content\s+)?pillars?,?\s+(?:unique\s+)?perspective|"
+    r"mission\s+and\s+beliefs|"
+    r"what\s+you'?re\s+against|"
+    r"walks?\s+through|"
+    r"before\s+\w+\s+closes|"
+    r"Marcus\s+closes?\s+promo|"
+    r"good\.?\s*Word\s+count|"
+    r"(?:Brand|content)\s+(?:and\s+content\s+)?docs?\b"
+    r")",
+    re.I
+)
+
+
+def _is_planning_line(text: str) -> bool:
+    """Return True if the line is primarily planning/meta text, not dialogue."""
+    if _COUNTING_EXPR.search(text):
+        return True
+    if _META_PLANNING.search(text):
+        return True
+    numbered_match = _NUMBERED_WORDS.search(text)
+    if numbered_match:
+        ratio = len(numbered_match.group(0)) / len(text) if text else 0
+        if ratio > 0.2 or len(numbered_match.group(0)) > 20:
+            return True
+    return False
+
+
+_NUMBERED_SUFFIX = re.compile(
+    r"[\w']+\(\d+\)(?:\s+[\w\-]+\d+)*\s*$|"  # word(1) word2 word3... at end
+    r"(?:\s+[\w\-]+\d+){2,}\s*$",  # word1 word2 word3... at end (2+ consecutive)
+    re.I
+)
+
+
+def _clean_dialogue_text(text: str) -> str:
+    """Remove word-count annotations and planning artifacts from dialogue text.
+    
+    Keeps the core dialogue intact while stripping:
+    - Word count suffixes: "= 30ish.", "= 22", "=20"
+    - Line number prefixes from dumps: "10|"
+    - Numbered-word suffixes: "What's(1) the2 practical3..." at end of line
+    """
+    if not text:
+        return ""
+    text = _LINE_NUMBER_PREFIX.sub("", text)
+    text = _WORD_COUNT_SUFFIX.sub("", text)
+    text = _NUMBERED_SUFFIX.sub("", text)
+    text = text.strip()
+    return text
+
+
+# --------------------------------------------------------------------------- #
 # Parsing
 # --------------------------------------------------------------------------- #
 
@@ -186,7 +273,11 @@ _SPEAKER_LINE = re.compile(r"^\s*(?:\*\*)?([A-Za-z一-鿿][A-Za-z0-9一-鿿 ._'\
 
 
 def parse_turns(raw: str, hosts: list[Host], segment: int = 0) -> list[Turn]:
-    """Parse `NAME: text` lines into turns, tolerating minor format drift."""
+    """Parse `NAME: text` lines into turns, tolerating minor format drift.
+    
+    Lines containing planning artifacts, word-count annotations, or meta
+    instructions are cleaned or rejected to prevent them from reaching TTS.
+    """
     exact = {h.name: h.name for h in hosts}
     lowered = {h.name.lower(): h.name for h in hosts}
     turns: list[Turn] = []
@@ -199,11 +290,19 @@ def parse_turns(raw: str, hosts: list[Host], segment: int = 0) -> list[Turn]:
             continue
         if line.startswith(("- ", "* ", "• ")):
             line = line[2:].strip()
+        line = _LINE_NUMBER_PREFIX.sub("", line)
         match = _SPEAKER_LINE.match(line)
         if not match:
             continue
         name, text = match.group(1).strip(), match.group(2).strip()
         text = text.strip().strip('"').strip("“”").strip()
+        if not text:
+            continue
+
+        if _is_planning_line(text):
+            continue
+
+        text = _clean_dialogue_text(text)
         if not text:
             continue
 
@@ -497,7 +596,7 @@ def _segment_prompt(language, style_desc, hosts, outline_line, chunk_text, unit_
             + _format_rule(language)
             + ("额外要求：" + extra + "\n" if extra else "")
             + "\n【本段素材】\n" + chunk_text + "\n\n"
-            "现在只输出台词本身，每行一句，不要任何解释或标记。"
+            "现在只输出台词本身，每行一句，不要任何解释、字数统计或规划备注。"
         )
     return (
         f"You are writing segment {segment_index + 1} of {total_segments} for a podcast.\n\n"
@@ -510,7 +609,8 @@ def _segment_prompt(language, style_desc, hosts, outline_line, chunk_text, unit_
         + _format_rule(language)
         + (f"EXTRA REQUIREMENTS: {extra}\n" if extra else "")
         + "\nSOURCE MATERIAL FOR THIS SEGMENT:\n" + chunk_text + "\n\n"
-        "Now output only the dialogue lines. No commentary, no headings, no notes."
+        "Now output only the dialogue lines. No commentary, no headings, no notes, "
+        "no word counts, no planning or meta-text."
     )
 
 
