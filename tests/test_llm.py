@@ -558,6 +558,143 @@ check(
 )
 
 # --------------------------------------------------------------------------- #
+# Token parameter selection tests (max_tokens vs max_completion_tokens)
+# --------------------------------------------------------------------------- #
+
+from podcaster.llm import LLMClient
+
+def get_payload_for_client(client: LLMClient) -> dict:
+    """Build a payload dict matching what chat() would create (without making a request)."""
+    effective_max = client.max_tokens
+    token_param_name = client._get_token_param_name()
+    return {
+        "model": client.model,
+        "messages": [],
+        "temperature": client.temperature,
+        token_param_name: effective_max,
+        "stream": False,
+    }
+
+def assert_single_token_param(payload: dict, test_name: str) -> None:
+    """Assert that payload contains exactly one of max_tokens or max_completion_tokens."""
+    has_max_tokens = "max_tokens" in payload
+    has_max_completion = "max_completion_tokens" in payload
+    if has_max_tokens and has_max_completion:
+        fails.append(f"{test_name}: payload contains BOTH max_tokens and max_completion_tokens")
+        print(f"FAIL: {test_name}: payload contains BOTH max_tokens and max_completion_tokens")
+    elif not has_max_tokens and not has_max_completion:
+        fails.append(f"{test_name}: payload contains NEITHER max_tokens nor max_completion_tokens")
+        print(f"FAIL: {test_name}: payload contains NEITHER max_tokens nor max_completion_tokens")
+    else:
+        print(f"PASS: {test_name}")
+
+client_standard = LLMClient(
+    base_url="https://api.openai.com/v1",
+    api_key="test-key",
+    model="gpt-4o",
+)
+payload_standard_client = get_payload_for_client(client_standard)
+assert_single_token_param(payload_standard_client, "standard model: only one token param")
+check(
+    "standard model (gpt-4o): uses max_tokens",
+    "max_tokens" in payload_standard_client and "max_completion_tokens" not in payload_standard_client,
+    f"got keys: {list(payload_standard_client.keys())}"
+)
+
+client_deepseek = LLMClient(
+    base_url="https://api.deepseek.com/v1",
+    api_key="test-key",
+    model="deepseek-r1",
+)
+payload_deepseek = get_payload_for_client(client_deepseek)
+assert_single_token_param(payload_deepseek, "deepseek-r1: only one token param")
+check(
+    "deepseek-r1 model: uses max_completion_tokens",
+    "max_completion_tokens" in payload_deepseek and "max_tokens" not in payload_deepseek,
+    f"got keys: {list(payload_deepseek.keys())}"
+)
+
+client_qwen = LLMClient(
+    base_url="https://api.qwen.com/v1",
+    api_key="test-key",
+    model="qwen-72b-chat",
+)
+payload_qwen = get_payload_for_client(client_qwen)
+assert_single_token_param(payload_qwen, "qwen model: only one token param")
+check(
+    "qwen model: uses max_completion_tokens",
+    "max_completion_tokens" in payload_qwen and "max_tokens" not in payload_qwen,
+    f"got keys: {list(payload_qwen.keys())}"
+)
+
+client_o1 = LLMClient(
+    base_url="https://api.openai.com/v1",
+    api_key="test-key",
+    model="o1-preview",
+)
+payload_o1 = get_payload_for_client(client_o1)
+assert_single_token_param(payload_o1, "o1-preview: only one token param")
+check(
+    "o1-preview model: uses max_completion_tokens",
+    "max_completion_tokens" in payload_o1 and "max_tokens" not in payload_o1,
+    f"got keys: {list(payload_o1.keys())}"
+)
+
+client_modelverse = LLMClient(
+    base_url="https://modelverse.astraflow.io/v1",
+    api_key="test-key",
+    model="some-custom-model",
+)
+payload_modelverse = get_payload_for_client(client_modelverse)
+assert_single_token_param(payload_modelverse, "modelverse URL: only one token param")
+check(
+    "modelverse URL: uses max_completion_tokens",
+    "max_completion_tokens" in payload_modelverse and "max_tokens" not in payload_modelverse,
+    f"got keys: {list(payload_modelverse.keys())}"
+)
+
+client_minimax = LLMClient(
+    base_url="https://api.minimaxi.com/v1",
+    api_key="test-key",
+    model="MiniMax-M2.5",
+)
+payload_minimax = get_payload_for_client(client_minimax)
+assert_single_token_param(payload_minimax, "minimax: only one token param")
+check(
+    "minimax model: uses max_tokens",
+    "max_tokens" in payload_minimax and "max_completion_tokens" not in payload_minimax,
+    f"got keys: {list(payload_minimax.keys())}"
+)
+
+client_explicit_override = LLMClient(
+    base_url="https://api.openai.com/v1",
+    api_key="test-key",
+    model="gpt-4o",
+    token_param="max_completion_tokens",
+)
+payload_explicit = get_payload_for_client(client_explicit_override)
+assert_single_token_param(payload_explicit, "explicit override: only one token param")
+check(
+    "explicit token_param override: uses max_completion_tokens despite standard model",
+    "max_completion_tokens" in payload_explicit and "max_tokens" not in payload_explicit,
+    f"got keys: {list(payload_explicit.keys())}"
+)
+
+client_explicit_max_tokens = LLMClient(
+    base_url="https://modelverse.astraflow.io/v1",
+    api_key="test-key",
+    model="deepseek-r1",
+    token_param="max_tokens",
+)
+payload_explicit_max = get_payload_for_client(client_explicit_max_tokens)
+assert_single_token_param(payload_explicit_max, "explicit max_tokens override: only one token param")
+check(
+    "explicit max_tokens override: uses max_tokens despite reasoning model",
+    "max_tokens" in payload_explicit_max and "max_completion_tokens" not in payload_explicit_max,
+    f"got keys: {list(payload_explicit_max.keys())}"
+)
+
+# --------------------------------------------------------------------------- #
 # Summary
 # --------------------------------------------------------------------------- #
 

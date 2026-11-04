@@ -128,13 +128,60 @@ def _extract_text(payload: dict[str, Any]) -> str:
 
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str,
-                 temperature: float = 0.7, max_tokens: int = 4096, timeout: float = 300.0):
+                 temperature: float = 0.7, max_tokens: int = 4096, timeout: float = 300.0,
+                 token_param: str | None = None):
+        """Initialize an OpenAI-compatible chat client.
+        
+        Args:
+            base_url: API endpoint (e.g. https://api.openai.com/v1).
+            api_key: Bearer token for authentication.
+            model: Model identifier to use.
+            temperature: Sampling temperature.
+            max_tokens: Maximum completion tokens.
+            timeout: HTTP timeout in seconds.
+            token_param: Which parameter to use for token limit:
+                - "max_tokens": Traditional OpenAI parameter (default for most models).
+                - "max_completion_tokens": Newer parameter for reasoning models.
+                - None: Auto-detect based on model name and base URL.
+        """
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = (api_key or "").strip()
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self._token_param = token_param
+
+    def _get_token_param_name(self) -> str:
+        """Determine which token parameter to use for this model/endpoint.
+        
+        Returns "max_completion_tokens" for reasoning models that require it,
+        otherwise returns "max_tokens" for broader compatibility.
+        """
+        if self._token_param:
+            return self._token_param
+        
+        model_lower = (self.model or "").lower()
+        url_lower = (self.base_url or "").lower()
+        
+        reasoning_model_patterns = (
+            "deepseek-r1", "deepseek-reasoner",
+            "qwen-", "qwen2", "qwq",
+            "o1-", "o1-mini", "o1-preview", "o3-",
+        )
+        reasoning_url_patterns = (
+            "modelverse", "astraflow",
+        )
+        
+        for pattern in reasoning_model_patterns:
+            if pattern in model_lower:
+                return "max_completion_tokens"
+        
+        for pattern in reasoning_url_patterns:
+            if pattern in url_lower:
+                return "max_completion_tokens"
+        
+        return "max_tokens"
 
     def _endpoint(self) -> str:
         base = self.base_url
@@ -149,12 +196,12 @@ class LLMClient:
         if not self.api_key:
             raise LLMError("LLM API key is not configured")
         effective_max = max_tokens or self.max_tokens
+        token_param_name = self._get_token_param_name()
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": effective_max,
-            "max_completion_tokens": effective_max,
+            token_param_name: effective_max,
             "stream": False,
         }
         headers = {
