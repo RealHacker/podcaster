@@ -1,8 +1,20 @@
 """Podcast script generation.
 
-The flow is: plan → write segment by segment → parse → assemble.
-Planning keeps long sources coherent; writing per chunk keeps each LLM call
-inside a sane context window.
+Two generation paths:
+
+1. SINGLE-PASS (short/medium sources):
+   When source text ≤ 12000 chars AND target ≤ 1200 words (~7-8 mins),
+   the complete script is generated in one LLM call with strong
+   anti-repetition instructions. This avoids the repetition that can
+   occur when segmented generation restates points across segments.
+
+2. MULTI-SEGMENT (long sources):
+   plan → write segment by segment → intro/outro → parse → assemble.
+   Planning keeps long sources coherent; writing per chunk keeps each
+   LLM call inside a sane context window.
+
+Both paths include parse filters that strip word-count annotations,
+numbered-word drafts, and planning artifacts from the final dialogue.
 """
 from __future__ import annotations
 
@@ -68,6 +80,12 @@ ROLE_BY_STYLE = {
     "educational": ("teacher", "curious listener"),
     "news": ("anchor", "co-anchor"),
 }
+
+# Thresholds for single-pass vs multi-segment generation.
+# Single-pass is used when source AND target output both fit comfortably.
+# Characters: source text length. Units: word count for English, chars for Chinese.
+SINGLE_PASS_SOURCE_CHARS = 12000  # ~3000 words / ~8 mins of source
+SINGLE_PASS_TARGET_UNITS = 1200   # ~1200 words → ~7-8 mins of dialogue
 
 
 @dataclass
@@ -201,9 +219,13 @@ _COUNTING_EXPR = re.compile(
 )
 
 # Pattern: numbered-word drafts, e.g. "What's(1) the2 practical3" or "word1 word2 word3"
+# Also catches patterns with trailing punctuation like "tripled33." and leading cruft like "(16?"
+# NOTE: Longer patterns must come FIRST since regex alternation is left-to-right.
 _NUMBERED_WORDS = re.compile(
-    r"[\w']+\(\d+\)\s+\w+\d+|"  # word(1) word2, allowing apostrophe
-    r"(?:\b[A-Za-z][A-Za-z\-_]*\d+\b\s*){3,}",  # word1 word2 word3 (at least 3, with hyphens)
+    r"(?:\b[A-Za-z][A-Za-z\-_']*\d+[.,;:!?]?\s*){3,}|"  # word1 word2 word3 (3+ consecutive)
+    r"[\w']+\(\d+\)(?:\s*[\w\-']+\d+)+|"  # word(1) word2 word3... (with parenthesis start)
+    r"[\w']+\(\d+\)\s*[\w\-]*\d+|"  # word(1) word2 (short version)
+    r"\(\d+\??\s*\w+\d+",  # (16? Goldman1 - truncated planning cruft
     re.I
 )
 
@@ -253,9 +275,12 @@ def _is_planning_line(text: str) -> bool:
     return False
 
 
+# Pattern: numbered-word suffix at end of line (for cleanup)
+# Handles trailing punctuation like "tripled33." and sequences with commas or ellipsis
 _NUMBERED_SUFFIX = re.compile(
-    r"[\w']+\(\d+\)(?:\s+[\w\-]+\d+)*\s*$|"  # word(1) word2 word3... at end
-    r"(?:\s+[\w\-]+\d+){2,}\s*$",  # word1 word2 word3... at end (2+ consecutive)
+    r"[\w']+\(\d+\)(?:\s*[\w\-]+\d+[.,;:!?…\.]*\s*)*[.,;:!?…\.]*\s*$|"  # word(1) word2... at end
+    r"(?:\s+[\w\-]+\d+[.,;:!?…\.]*){2,}[.,;:!?…\.]*\s*$|"  # word1 word2 word3... at end
+    r"\s*\(\d+\??\s*[\w\-]+\d+[^)]*$",  # (16? Goldman1 Sachs2 - truncated planning
     re.I
 )
 
@@ -422,6 +447,130 @@ def parse_turns(raw: str, hosts: list[Host], segment: int = 0) -> list[Turn]:
 # Generation
 # --------------------------------------------------------------------------- #
 
+def _should_use_single_pass(source_text: str, total_units: int, language: str) -> bool:
+    """Return True when source and target both fit comfortably in one LLM call.
+    
+    This avoids unnecessary chunking and segmentation that can cause repetition
+    in short-to-medium podcasts.
+    """
+    source_chars = len(source_text or "")
+    return source_chars <= SINGLE_PASS_SOURCE_CHARS and total_units <= SINGLE_PASS_TARGET_UNITS
+
+
+def _single_pass_prompt(
+    language: str,
+    style_desc: str,
+    hosts: list[Host],
+    source_text: str,
+    total_units: int,
+    title: str,
+    extra: str,
+    role_hint: str,
+) -> str:
+    """Build a prompt for single-pass full-script generation.
+    
+    Includes strong anti-repetition instructions to prevent the model from
+    restating the same points across hook, body, and sign-off.
+    """
+    if language == "zh":
+        return (
+            f"你正在为一档播客写完整的台词脚本。\n\n"
+            f"节目名：{title}\n"
+            f"风格：{style_desc}\n"
+            f"目标总长度：约 {total_units} 字\n"
+            + (role_hint + "\n" if role_hint else "")
+            + _host_block(hosts, language)
+            + _format_rule(language)
+            + "重要规则：\n"
+            "- 每个观点或事实只说一次，不要换种方式重复\n"
+            "- 开头不要用在结尾重复；结尾只是简短告别\n"
+            "- 不要输出任何计数、字数统计或规划备注\n"
+            "- 直接输出对话，不要任何解释\n\n"
+            + ("额外要求：" + extra + "\n\n" if extra else "")
+            + "【完整素材】\n" + source_text + "\n\n"
+            "现在输出完整的对话脚本，包含简短的开场白和结语。每行一句，格式严格为 `说话人姓名: 台词内容`。"
+        )
+    return (
+        f"You are writing the COMPLETE dialogue script for a podcast episode.\n\n"
+        f"EPISODE TITLE: {title}\n"
+        f"STYLE: {style_desc}\n"
+        f"TARGET LENGTH: about {total_units} words total\n"
+        + (role_hint + "\n" if role_hint else "")
+        + _host_block(hosts, language)
+        + _format_rule(language)
+        + "\nCRITICAL ANTI-REPETITION RULES:\n"
+        "- State each point, fact, or statistic EXACTLY ONCE. Do not rephrase or restate it.\n"
+        "- The intro hook must NOT be repeated or paraphrased in the body or outro.\n"
+        "- The outro is a brief sign-off only — do NOT summarize or restate points from the episode.\n"
+        "- Never include word counts, counting, numbered-word drafts, or planning notes.\n"
+        "- Move forward through the material; never loop back to cover the same ground.\n\n"
+        + (f"EXTRA REQUIREMENTS: {extra}\n\n" if extra else "")
+        + "FULL SOURCE MATERIAL:\n" + source_text + "\n\n"
+        "Now output the COMPLETE dialogue script with a brief hook opening and a short sign-off. "
+        "Every line must be formatted as `SPEAKER_NAME: dialogue`. No headings, no commentary."
+    )
+
+
+def _generate_single_pass(
+    client: LLMClient,
+    source_text: str,
+    hosts: list[Host],
+    *,
+    language: str,
+    style: str,
+    style_desc: str,
+    total_units: int,
+    title: str,
+    extra_instructions: str,
+    progress: ProgressFn | None,
+) -> Script:
+    """Generate the entire script in one LLM call for short/medium sources."""
+    def report(stage: str, pct: float) -> None:
+        if progress:
+            progress(stage, max(0.0, min(1.0, pct)))
+
+    report("Writing complete script (single pass)", 0.15)
+    
+    role_hint = _role_hint(style, hosts, language)
+    prompt = _single_pass_prompt(
+        language=language,
+        style_desc=style_desc,
+        hosts=hosts,
+        source_text=source_text,
+        total_units=total_units,
+        title=title,
+        extra=extra_instructions,
+        role_hint=role_hint,
+    )
+    
+    raw = client.chat(
+        [{"role": "system", "content": "You write broadcast-ready podcast dialogue."},
+         {"role": "user", "content": prompt}],
+        temperature=0.8,
+        max_tokens=min(8000, int(total_units * 4) + 800)
+    )
+    
+    report("Parsing dialogue", 0.75)
+    turns = parse_turns(raw, hosts, segment=0)
+    turns = _trim_to_target(turns, total_units, language)
+    
+    for i, turn in enumerate(turns):
+        turn.index = i
+    
+    script = Script(
+        title=title or "Podcast",
+        hosts=hosts,
+        style=style,
+        language=language,
+        target_minutes=total_units / SPEECH_UNITS_PER_MINUTE.get(language, 157.0),
+        turns=turns,
+        outline=["Single-pass generation"],
+    )
+    
+    report("Script complete", 0.85)
+    return script
+
+
 def _condensed_source(text: str, chunks: list, limit: int = 11000) -> str:
     """A compressed view of the source for the planning call."""
     parts = [text[:2500]]
@@ -454,6 +603,25 @@ def generate_script(
     units_per_minute = SPEECH_UNITS_PER_MINUTE.get(language, SPEECH_UNITS_PER_MINUTE["en"])
     total_units = max(60, int(target_minutes * units_per_minute))
 
+    # ---- Single-pass path for short/medium sources ----------------------- #
+    # When source and target both fit comfortably, generate the complete
+    # script in one call to avoid repetition from segmented generation.
+    if _should_use_single_pass(source_text, total_units, language):
+        report("Using single-pass generation", 0.05)
+        return _generate_single_pass(
+            client,
+            source_text,
+            hosts,
+            language=language,
+            style=style,
+            style_desc=style_desc,
+            total_units=total_units,
+            title=title_hint or "Podcast",
+            extra_instructions=extra_instructions,
+            progress=progress,
+        )
+
+    # ---- Multi-segment path for long sources ----------------------------- #
     script = Script(title=title_hint or "Podcast", hosts=hosts, style=style,
                     language=language, target_minutes=target_minutes)
 
@@ -705,6 +873,7 @@ def _segment_prompt(language, style_desc, hosts, outline_line, chunk_text, unit_
             + _host_block(hosts, language)
             + prior_block
             + _format_rule(language)
+            + "重要：每个观点只说一次，不要换种方式重复。不要输出任何计数或规划备注。\n"
             + ("额外要求：" + extra + "\n" if extra else "")
             + "\n【本段素材】\n" + chunk_text + "\n\n"
             "现在只输出台词本身，每行一句，不要任何解释、字数统计或规划备注。"
@@ -719,6 +888,8 @@ def _segment_prompt(language, style_desc, hosts, outline_line, chunk_text, unit_
         + _host_block(hosts, language)
         + prior_block
         + _format_rule(language)
+        + "\nIMPORTANT: State each point ONCE. Do not rephrase or restate. "
+        "No word counts, no numbered-word drafts, no planning notes.\n"
         + (f"EXTRA REQUIREMENTS: {extra}\n" if extra else "")
         + "\nSOURCE MATERIAL FOR THIS SEGMENT:\n" + chunk_text + "\n\n"
         "Now output only the dialogue lines. No commentary, no headings, no notes, "
@@ -739,7 +910,7 @@ def _intro_outro_prompt(language, style_desc, hosts, title, outline, budget) -> 
             "# INTRO\n"
             "（最多2句让人想听下去的片头，不要用“欢迎收听”这种套话）\n"
             "# OUTRO\n"
-            "（最多1句简短的结尾和告别）\n\n"
+            "（最多1句简短的结尾和告别，不要重复片头的内容）\n\n"
             + _format_rule(language)
         )
     return (
@@ -752,7 +923,7 @@ def _intro_outro_prompt(language, style_desc, hosts, title, outline, budget) -> 
         "# INTRO\n"
         "(at most 2 hook lines that make people want to keep listening — no 'welcome to the show' boilerplate)\n"
         "# OUTRO\n"
-        "(at most 1 short sign-off line)\n\n"
+        "(at most 1 short sign-off line — do NOT repeat or rephrase the intro hook)\n\n"
         + _format_rule(language)
     )
 
