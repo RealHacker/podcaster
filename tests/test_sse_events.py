@@ -94,7 +94,7 @@ def test_sse_endpoint_stream() -> None:
 
     original = jobs_mod.run_pipeline
 
-    def fake_pipeline(request, workdir, on_step, log, should_cancel):
+    def fake_pipeline(request, workdir, on_step, log, should_cancel, job=None, resume_from=None):
         log("info", "Job started")
         on_step("Reading the source material", 0.15)
         log("info", "Loaded source")

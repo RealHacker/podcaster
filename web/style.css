@@ -221,6 +221,12 @@ output { min-width: 58px; text-align: right; font-weight: 650; color: var(--cyan
 .status-pill.done { background: rgba(52,211,153,.15); color: #6ee7b7; border-color: rgba(52,211,153,.3); }
 .status-pill.error { background: rgba(248,113,113,.15); color: #fca5a5; border-color: rgba(248,113,113,.3); }
 .status-pill.cancelled { background: rgba(251,191,36,.14); color: #fcd34d; border-color: rgba(251,191,36,.3); }
+.status-pill.interrupted { background: rgba(139,92,246,.18); color: #c4b5fd; border-color: rgba(139,92,246,.35); }
+
+.btn.danger { background: rgba(248,113,113,.15); border-color: rgba(248,113,113,.4); color: #fca5a5; }
+.btn.danger:hover { background: rgba(248,113,113,.25); border-color: rgba(248,113,113,.55); }
+.btn.resume { background: rgba(139,92,246,.15); border-color: rgba(139,92,246,.4); color: #c4b5fd; }
+.btn.resume:hover { background: rgba(139,92,246,.25); border-color: rgba(139,92,246,.55); }
 
 .progress-wrap { display: flex; align-items: center; gap: 12px; }
 .progress { flex: 1; height: 7px; background: #0a1220; border-radius: 20px; overflow: hidden; border: 1px solid var(--line-soft); }

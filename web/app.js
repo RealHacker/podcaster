@@ -399,6 +399,8 @@
   }
 
   const REVIEW_STATUSES = ["awaiting_script_review", "awaiting_audio_review", "awaiting_slides_review"];
+  const RESUMABLE_STATUSES = ["interrupted", "running", ...REVIEW_STATUSES];
+  const DELETABLE_STATUSES = ["done", "error", "cancelled", "interrupted"];
 
   function renderJob(job) {
     state.activeJob = job;
@@ -443,6 +445,15 @@
 
     const actions = $("#jdActions");
     actions.innerHTML = "";
+
+    if (RESUMABLE_STATUSES.includes(job.status)) {
+      const resumeBtn = document.createElement("button");
+      resumeBtn.className = "btn resume";
+      resumeBtn.textContent = "▶ Resume";
+      resumeBtn.onclick = () => resumeJob(job.id);
+      actions.appendChild(resumeBtn);
+    }
+
     if (job.result && job.result.export_path) {
       const link = document.createElement("a");
       link.className = "btn primary";
@@ -471,6 +482,15 @@
       err.style.color = "#fca5a5";
       err.textContent = job.error;
       actions.appendChild(err);
+    }
+
+    if (DELETABLE_STATUSES.includes(job.status)) {
+      const deleteBtn = document.createElement("button");
+      deleteBtn.className = "btn danger sm";
+      deleteBtn.textContent = "🗑 Delete";
+      deleteBtn.style.marginLeft = "auto";
+      deleteBtn.onclick = () => deleteJob(job.id);
+      actions.appendChild(deleteBtn);
     }
 
     renderReviewPanel(job);
@@ -754,6 +774,39 @@
       }
     };
     es.onerror = () => { /* the browser retries automatically */ };
+  }
+
+  async function resumeJob(jobId) {
+    try {
+      toast("Resuming job...");
+      const data = await api(`/api/jobs/${jobId}/resume`, { method: "POST" });
+      if (data.ok) {
+        toast("Job resumed", "ok");
+        selectJob(jobId);
+        openStream(jobId);
+        loadJobs();
+      }
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  }
+
+  async function deleteJob(jobId) {
+    if (!confirm("Delete this job and its temporary files?\n\nFinal exported audio/video will be kept.")) {
+      return;
+    }
+    try {
+      const data = await api(`/api/jobs/${jobId}`, { method: "DELETE" });
+      if (data.ok) {
+        toast(`Deleted job (${data.deleted_files?.length || 0} temp files removed)`, "ok");
+        loadJobs();
+        $("#jobEmpty").hidden = false;
+        $("#jobDetailBody").hidden = true;
+        state.currentJobId = null;
+      }
+    } catch (err) {
+      toast(err.message, "err");
+    }
   }
 
   $("#refreshJobs").addEventListener("click", loadJobs);

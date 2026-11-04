@@ -254,6 +254,37 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
     return {"ok": True, "status": job.status}
 
 
+@app.post("/api/jobs/{job_id}/resume")
+async def resume_job(job_id: str) -> dict[str, Any]:
+    """Resume an interrupted job from its last phase."""
+    from podcaster.jobs import RESUMABLE_STATUSES
+
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status not in RESUMABLE_STATUSES:
+        raise HTTPException(
+            400,
+            f"Cannot resume job in status '{job.status}'. "
+            f"Only jobs in states {RESUMABLE_STATUSES} can be resumed."
+        )
+
+    resumed = store.resume(job_id)
+    if not resumed:
+        raise HTTPException(500, "Failed to resume job")
+
+    return {"ok": True, "job": resumed.to_dict()}
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str, keep_exports: bool = True) -> dict[str, Any]:
+    """Delete a job and its temporary files, keeping final exports by default."""
+    result = store.delete(job_id, keep_exports=keep_exports)
+    if not result["ok"]:
+        raise HTTPException(400, result.get("error", "Delete failed"))
+    return result
+
+
 @app.get("/api/jobs/{job_id}/events")
 async def job_events(job_id: str, request: Request) -> StreamingResponse:
     job = store.get(job_id)
