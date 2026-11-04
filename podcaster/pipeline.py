@@ -206,6 +206,8 @@ def _build_video_segments(
     cfg: dict[str, Any],
     log: Logger,
     on_step: Callable[[str, float], None],
+    job: "Job | None" = None,
+    should_run_phase: Callable[[str], bool] = lambda _: True,
 ) -> tuple[list[media_mod.VideoSegment], str]:
     """Build the video segments and pick the layout.
 
@@ -254,7 +256,9 @@ def _build_video_segments(
                 log("warn", "No slide images could be generated — using the waveform layout.")
                 plan = []
             # ---- Slides review gate --------------------------------------- #
-            elif req.enable_review and job is not None:
+            elif should_run_phase("slides_review") and req.enable_review and job is not None:
+                if job:
+                    job.set_phase("slides_review")
                 job.set_review_data(
                     slides=[{
                         "index": s.index,
@@ -359,25 +363,56 @@ def run_pipeline(
     log: Logger,
     should_cancel: Callable[[], bool] = lambda: False,
     job: "Job | None" = None,
+    resume_from: str | None = None,
 ) -> dict[str, Any]:
     cfg = config_mod.load()
     workdir.mkdir(parents=True, exist_ok=True)
 
+    # Phase ordering for resume support
+    phases = ["source", "chunks", "script", "script_review", "tts", "audio_review", "merge", "video", "slides_review", "done"]
+    skip_until = phases.index(resume_from) if resume_from and resume_from in phases else 0
+
+    def should_run_phase(phase: str) -> bool:
+        return phases.index(phase) >= skip_until
+
+    def set_phase(phase: str) -> None:
+        if job:
+            job.set_phase(phase)
+
     # ---- 1. Source -------------------------------------------------------- #
-    on_step("Reading the source material", 0.03)
-    doc = resolve_source(req)
-    log("info", f"Loaded {doc.kind} source: {len(doc.text):,} characters from {doc.origin}")
-    if len(doc.text.strip()) < 120:
-        raise PipelineError("The source material is too short to build a podcast from.")
+    set_phase("source")
+    if should_run_phase("source"):
+        on_step("Reading the source material", 0.03)
+        doc = resolve_source(req)
+        log("info", f"Loaded {doc.kind} source: {len(doc.text):,} characters from {doc.origin}")
+        if len(doc.text.strip()) < 120:
+            raise PipelineError("The source material is too short to build a podcast from.")
+        if job:
+            job.save_pipeline_state("source", {"text": doc.text, "title": doc.title, "origin": doc.origin, "kind": doc.kind})
+    else:
+        source_state = job.load_pipeline_state("source") if job else None
+        if not source_state:
+            raise PipelineError("Cannot resume: source state not found")
+        doc = SourceDoc(text=source_state["text"], title=source_state["title"],
+                        origin=source_state["origin"], kind=source_state["kind"], meta={})
+        log("info", f"Resumed with source: {len(doc.text):,} characters")
 
     # ---- 2. Chunks -------------------------------------------------------- #
-    on_step("Splitting the source into chunks", 0.07)
+    set_phase("chunks")
     chunk_size = max(1200, min(20000, int(req.chunk_chars or 6000)))
-    chunks = split_into_chunks(doc.text, chunk_size)
-    log("info", f"Split into {len(chunks)} chunk(s) of ~{chunk_size} characters")
+    if should_run_phase("chunks"):
+        on_step("Splitting the source into chunks", 0.07)
+        chunks = split_into_chunks(doc.text, chunk_size)
+        log("info", f"Split into {len(chunks)} chunk(s) of ~{chunk_size} characters")
+        if job:
+            job.save_pipeline_state("chunks", chunks)
+    else:
+        chunks = job.load_pipeline_state("chunks") if job else None
+        if not chunks:
+            chunks = split_into_chunks(doc.text, chunk_size)
 
     # ---- 3. Script -------------------------------------------------------- #
-    on_step("Writing the podcast script", 0.1)
+    set_phase("script")
     hosts = build_hosts(req, cfg)
     log("info", "Casting: " + ", ".join(f"{h.name} ({h.gender}) → {h.voice_id}" for h in hosts))
 
@@ -388,29 +423,51 @@ def run_pipeline(
         temperature=float(cfg.get("llm_temperature", 0.7)),
         max_tokens=int(cfg.get("llm_max_tokens", 4096)),
     )
-    if not client.api_key:
-        raise PipelineError("The LLM API key is not configured. Add it in Settings.")
 
-    script = generate_script(
-        client,
-        source_text=doc.text,
-        chunks=chunks,
-        hosts=hosts,
-        language=req.language,
-        style=req.style,
-        target_minutes=req.length_minutes,
-        title_hint=req.title or doc.title,
-        extra_instructions=req.extra_instructions,
-        progress=lambda stage, pct: on_step(stage, 0.1 + pct * 0.5),
-    )
-    if not script.turns:
-        raise PipelineError("The script generator produced no usable dialogue lines.")
-    script.title = req.title or script.title or doc.title
-    log("info", f"Script written: {len(script.turns)} turns, "
-                f"~{len(script.text):,} characters of dialogue")
+    script = None
+    if should_run_phase("script"):
+        on_step("Writing the podcast script", 0.1)
+        if not client.api_key:
+            raise PipelineError("The LLM API key is not configured. Add it in Settings.")
+        script = generate_script(
+            client,
+            source_text=doc.text,
+            chunks=chunks,
+            hosts=hosts,
+            language=req.language,
+            style=req.style,
+            target_minutes=req.length_minutes,
+            title_hint=req.title or doc.title,
+            extra_instructions=req.extra_instructions,
+            progress=lambda stage, pct: on_step(stage, 0.1 + pct * 0.5),
+        )
+        if not script.turns:
+            raise PipelineError("The script generator produced no usable dialogue lines.")
+        script.title = req.title or script.title or doc.title
+        log("info", f"Script written: {len(script.turns)} turns, "
+                    f"~{len(script.text):,} characters of dialogue")
+        if job:
+            job.save_pipeline_state("script", {
+                "title": script.title,
+                "outline": script.outline,
+                "turns": [{"index": t.index, "speaker": t.speaker, "text": t.text, "segment": t.segment}
+                          for t in script.turns],
+            })
+    else:
+        script_state = job.load_pipeline_state("script") if job else None
+        if not script_state:
+            raise PipelineError("Cannot resume: script state not found")
+        script = Script(
+            title=script_state["title"],
+            outline=script_state.get("outline", []),
+            turns=[Turn(speaker=t["speaker"], text=t["text"], index=t["index"], segment=t.get("segment", ""))
+                   for t in script_state["turns"]],
+        )
+        log("info", f"Resumed with script: {len(script.turns)} turns")
 
     # ---- Script review gate ----------------------------------------------- #
-    if req.enable_review and job is not None:
+    set_phase("script_review")
+    if should_run_phase("script_review") and req.enable_review and job is not None:
         job.set_review_data(
             script_title=script.title,
             script_outline=list(script.outline),
@@ -434,8 +491,16 @@ def run_pipeline(
                             for t in updated_turns]
             script.title = job.review_data.script_title or script.title
             log("info", f"Script updated: {len(script.turns)} turns after review")
+            if job:
+                job.save_pipeline_state("script", {
+                    "title": script.title,
+                    "outline": script.outline,
+                    "turns": [{"index": t.index, "speaker": t.speaker, "text": t.text, "segment": t.segment}
+                              for t in script.turns],
+                })
 
     # ---- 4. TTS ----------------------------------------------------------- #
+    set_phase("tts")
     tts_cfg = dict(cfg)
     tts_cfg["tts_speed"] = req.tts_speed or cfg.get("tts_speed", 1.0)
     tts = build_tts(tts_cfg)
@@ -449,60 +514,75 @@ def run_pipeline(
     total = len(script.turns)
     want_subtitles = req.export_format == "video" and bool(req.show_subtitles)
 
-    use_parallel = cfg.get("tts_parallel", False)
-    parallel_workers = max(1, min(6, int(cfg.get("tts_parallel_workers", 2))))
+    if should_run_phase("tts"):
+        use_parallel = cfg.get("tts_parallel", False)
+        parallel_workers = max(1, min(6, int(cfg.get("tts_parallel_workers", 2))))
 
-    if use_parallel and total > 1:
-        log("info", f"Using parallel TTS with {parallel_workers} workers")
-        on_step(f"Generating audio for {total} turns (parallel)", 0.60)
-        futures_map: dict[Any, int] = {}
-        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+        if use_parallel and total > 1:
+            log("info", f"Using parallel TTS with {parallel_workers} workers")
+            on_step(f"Generating audio for {total} turns (parallel)", 0.60)
+            futures_map: dict[Any, int] = {}
+            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                for i, turn in enumerate(script.turns):
+                    if should_cancel():
+                        raise PipelineError("Cancelled by the user.")
+                    host = voice_by_name.get(turn.speaker) or hosts[0]
+                    voice = host.voice_id or hosts[0].voice_id
+                    future = executor.submit(
+                        _synthesize_turn, i, turn, voice, tts, clips_dir, req,
+                        max_chars, want_subtitles)
+                    futures_map[future] = i
+
+                results_by_index: dict[int, dict[str, Any]] = {}
+                completed = 0
+                for future in as_completed(futures_map):
+                    if should_cancel():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise PipelineError("Cancelled by the user.")
+                    idx = futures_map[future]
+                    try:
+                        result = future.result()
+                        results_by_index[idx] = result
+                    except Exception as exc:
+                        raise PipelineError(f"TTS failed for turn {idx + 1}: {exc}") from exc
+                    completed += 1
+                    on_step(f"Generating audio ({completed}/{total})", 0.60 + 0.25 * (completed / total))
+
+            for i in range(total):
+                record = results_by_index[i]
+                clip_records.append(record)
+                for fname in record["files"]:
+                    clips.append(clips_dir / fname)
+        else:
             for i, turn in enumerate(script.turns):
                 if should_cancel():
                     raise PipelineError("Cancelled by the user.")
+                on_step(f"Generating audio for turn {i + 1}/{total}", 0.6 + 0.25 * (i / max(1, total)))
                 host = voice_by_name.get(turn.speaker) or hosts[0]
                 voice = host.voice_id or hosts[0].voice_id
-                future = executor.submit(
-                    _synthesize_turn, i, turn, voice, tts, clips_dir, req,
-                    max_chars, want_subtitles)
-                futures_map[future] = i
+                record = _synthesize_turn(i, turn, voice, tts, clips_dir, req, max_chars, want_subtitles)
+                clips.extend(clips_dir / fname for fname in record["files"])
+                clip_records.append(record)
 
-            results_by_index: dict[int, dict[str, Any]] = {}
-            completed = 0
-            for future in as_completed(futures_map):
-                if should_cancel():
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    raise PipelineError("Cancelled by the user.")
-                idx = futures_map[future]
-                try:
-                    result = future.result()
-                    results_by_index[idx] = result
-                except Exception as exc:
-                    raise PipelineError(f"TTS failed for turn {idx + 1}: {exc}") from exc
-                completed += 1
-                on_step(f"Generating audio ({completed}/{total})", 0.60 + 0.25 * (completed / total))
-
-        for i in range(total):
-            record = results_by_index[i]
-            clip_records.append(record)
-            for fname in record["files"]:
-                clips.append(clips_dir / fname)
+        if job:
+            job.save_pipeline_state("clip_records", clip_records)
     else:
-        for i, turn in enumerate(script.turns):
-            if should_cancel():
-                raise PipelineError("Cancelled by the user.")
-            on_step(f"Generating audio for turn {i + 1}/{total}", 0.6 + 0.25 * (i / max(1, total)))
-            host = voice_by_name.get(turn.speaker) or hosts[0]
-            voice = host.voice_id or hosts[0].voice_id
-            record = _synthesize_turn(i, turn, voice, tts, clips_dir, req, max_chars, want_subtitles)
-            clips.extend(clips_dir / fname for fname in record["files"])
-            clip_records.append(record)
+        clip_records = job.load_pipeline_state("clip_records") if job else None
+        if not clip_records:
+            raise PipelineError("Cannot resume: audio clips state not found")
+        clips = [clips_dir / fname for r in clip_records for fname in r["files"]]
+        # Verify clips exist
+        missing = [str(c) for c in clips if not c.exists()]
+        if missing:
+            raise PipelineError(f"Cannot resume: missing audio files: {missing[:3]}")
+        log("info", f"Resumed with {len(clips)} audio clips")
 
     if should_cancel():
         raise PipelineError("Cancelled by the user.")
 
     # ---- Audio review gate ------------------------------------------------ #
-    if req.enable_review and job is not None:
+    set_phase("audio_review")
+    if should_run_phase("audio_review") and req.enable_review and job is not None:
         job.set_review_data(
             audio_clips=[{
                 "index": r["index"],
@@ -519,7 +599,7 @@ def run_pipeline(
         clips = [clips_dir / fname for r in clip_records for fname in r["files"]]
 
     # ---- 5. Merge audio --------------------------------------------------- #
-    on_step("Merging the audio clips", 0.86)
+    set_phase("merge")
     export_path = resolve_export_path(req, script.title)
 
     # For a video export the final artefact is the MP4, so the merged audio is
@@ -529,17 +609,33 @@ def run_pipeline(
     else:
         audio_target = export_path
 
-    merged = media_mod.merge_audio(clips, audio_target, gap_seconds=req.gap_seconds,
-                                   workdir=workdir)
-    log("info", f"Merged {len(clips)} clips into {audio_target.name} "
-                f"({merged.duration / 60:.1f} min)")
+    merged = None
+    if should_run_phase("merge"):
+        on_step("Merging the audio clips", 0.86)
+        merged = media_mod.merge_audio(clips, audio_target, gap_seconds=req.gap_seconds,
+                                       workdir=workdir)
+        log("info", f"Merged {len(clips)} clips into {audio_target.name} "
+                    f"({merged.duration / 60:.1f} min)")
+        if job:
+            job.save_pipeline_state("merged", {"path": str(merged.path), "duration": merged.duration})
+    else:
+        merged_state = job.load_pipeline_state("merged") if job else None
+        if merged_state and Path(merged_state["path"]).exists():
+            merged = media_mod.MergedAudio(path=Path(merged_state["path"]), duration=merged_state["duration"])
+            log("info", f"Resumed with merged audio: {merged.path.name}")
+        else:
+            on_step("Re-merging audio clips", 0.86)
+            merged = media_mod.merge_audio(clips, audio_target, gap_seconds=req.gap_seconds,
+                                           workdir=workdir)
+            log("info", f"Re-merged {len(clips)} clips")
 
     # ---- 6. Video (optional) ---------------------------------------------- #
+    set_phase("video")
     video_path: Path | None = None
     slide_count = 0
-    if req.export_format == "video":
+    if req.export_format == "video" and should_run_phase("video"):
         video_segments, mode = _build_video_segments(
-            req, script, hosts, clip_records, clips_dir, workdir, client, cfg, log, on_step)
+            req, script, hosts, clip_records, clips_dir, workdir, client, cfg, log, on_step, job, should_run_phase)
         slide_count = len({segment.slide for segment in video_segments if segment.slide})
         on_step("Rendering the slide video" if mode == "slides"
                 else "Rendering the waveform video", 0.93)
@@ -555,6 +651,12 @@ def run_pipeline(
         )
         log("info", f"Rendered video: {video_path.name}")
         export_path = video_path
+    elif req.export_format == "video":
+        video_export = export_path.with_suffix(".mp4")
+        if video_export.exists():
+            video_path = video_export
+            export_path = video_path
+            log("info", f"Resumed with existing video: {video_path.name}")
 
     # ---- 7. Artefacts ------------------------------------------------------ #
     script_path = workdir / "script.txt"

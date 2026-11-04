@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
+import shutil
 import threading
 import time
 import uuid
@@ -16,6 +18,23 @@ from .pipeline import PodcastRequest, PipelineError, run_pipeline
 
 REVIEW_STATUSES = ("awaiting_script_review", "awaiting_audio_review", "awaiting_slides_review")
 TERMINAL_STATUSES = ("done", "error", "cancelled")
+INTERRUPTED_STATUSES = ("running",) + REVIEW_STATUSES
+RESUMABLE_STATUSES = INTERRUPTED_STATUSES + ("interrupted",)
+
+PHASES = (
+    "source",
+    "chunks",
+    "script",
+    "script_review",
+    "tts",
+    "audio_review",
+    "merge",
+    "video",
+    "slides_review",
+    "done",
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,7 +62,7 @@ class ReviewData:
 class Job:
     id: str
     request: PodcastRequest
-    status: str = "queued"          # queued | running | done | error | cancelled | awaiting_*_review
+    status: str = "queued"          # queued | running | done | error | cancelled | awaiting_*_review | interrupted
     step: str = "Queued"
     progress: float = 0.0
     message: str = ""
@@ -55,12 +74,14 @@ class Job:
     result: dict[str, Any] | None = None
     workdir: str = ""
     review_data: ReviewData = field(default_factory=ReviewData)
+    current_phase: str = "source"   # tracks pipeline phase for resume
     _events: "queue.Queue[dict[str, Any]]" = field(default_factory=queue.Queue, repr=False)
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
     _resume: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _seq: int = field(default=0, repr=False)
     _pipeline_state: dict[str, Any] = field(default_factory=dict, repr=False)
+    _persist_callback: Any = field(default=None, repr=False)  # callback to trigger persistence
 
     # -- updates ---------------------------------------------------------- #
     def _emit(self, payload: dict[str, Any]) -> None:
@@ -74,6 +95,20 @@ class Job:
             self._events.put_nowait(payload)
         except queue.Full:
             pass
+
+    def _trigger_persist(self) -> None:
+        """Notify the store to persist job state."""
+        if self._persist_callback:
+            try:
+                self._persist_callback()
+            except Exception:
+                pass
+
+    def set_phase(self, phase: str) -> None:
+        """Track which pipeline phase the job is in for resume support."""
+        with self._lock:
+            self.current_phase = phase
+        self._trigger_persist()
 
     def log(self, level: str, message: str) -> None:
         entry = {"t": time.time(), "level": level, "message": message}
@@ -100,6 +135,7 @@ class Job:
                 self.finished_at = time.time()
                 self.progress = 1.0 if status == "done" else self.progress
         self._emit({"type": "status", "status": status, "error": error})
+        self._trigger_persist()
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -172,6 +208,8 @@ class Job:
                 "finished_at": self.finished_at,
                 "elapsed": ((self.finished_at or time.time()) - (self.started_at or self.created_at)),
                 "result": self._serialize_result(self.result),
+                "current_phase": self.current_phase,
+                "workdir": self.workdir,
                 "request": {
                     "language": self.request.language,
                     "style": self.request.style,
@@ -204,32 +242,196 @@ class Job:
         out.pop("clips", None)
         return out
 
+    def to_persist_dict(self) -> dict[str, Any]:
+        """Full serialization for disk persistence, includes all fields needed for resume."""
+        with self._lock:
+            return {
+                "id": self.id,
+                "status": self.status,
+                "step": self.step,
+                "progress": self.progress,
+                "message": self.message,
+                "error": self.error,
+                "created_at": self.created_at,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "logs": list(self.logs[-100:]),  # keep last 100 logs
+                "result": self._serialize_result(self.result),
+                "workdir": self.workdir,
+                "current_phase": self.current_phase,
+                "review_data": self.review_data.to_dict(),
+                "request": self._serialize_request(),
+                "pipeline_state": dict(self._pipeline_state),
+            }
+
+    def _serialize_request(self) -> dict[str, Any]:
+        """Serialize the full PodcastRequest for persistence."""
+        req = self.request
+        return {
+            "source_type": req.source_type,
+            "source_url": req.source_url,
+            "source_text": req.source_text,
+            "source_path": req.source_path,
+            "language": req.language,
+            "length_minutes": req.length_minutes,
+            "style": req.style,
+            "host_count": req.host_count,
+            "host_genders": list(req.host_genders),
+            "host_names": list(req.host_names),
+            "host_personas": list(req.host_personas),
+            "voice_overrides": dict(req.voice_overrides),
+            "export_format": req.export_format,
+            "export_path": req.export_path,
+            "title": req.title,
+            "extra_instructions": req.extra_instructions,
+            "tts_speed": req.tts_speed,
+            "gap_seconds": req.gap_seconds,
+            "chunk_chars": req.chunk_chars,
+            "keep_workdir": req.keep_workdir,
+            "show_subtitles": req.show_subtitles,
+            "show_slides": req.show_slides,
+            "enable_review": req.enable_review,
+        }
+
+    @classmethod
+    def from_persist_dict(cls, data: dict[str, Any]) -> "Job":
+        """Restore a Job from persisted data."""
+        req_data = data.get("request", {})
+        request = PodcastRequest(
+            source_type=req_data.get("source_type", "url"),
+            source_url=req_data.get("source_url", ""),
+            source_text=req_data.get("source_text", ""),
+            source_path=req_data.get("source_path", ""),
+            language=req_data.get("language", "en"),
+            length_minutes=float(req_data.get("length_minutes", 5.0)),
+            style=req_data.get("style", "narrative"),
+            host_count=int(req_data.get("host_count", 2)),
+            host_genders=list(req_data.get("host_genders", [])),
+            host_names=list(req_data.get("host_names", [])),
+            host_personas=list(req_data.get("host_personas", [])),
+            voice_overrides=dict(req_data.get("voice_overrides", {})),
+            export_format=req_data.get("export_format", "audio"),
+            export_path=req_data.get("export_path", ""),
+            title=req_data.get("title", ""),
+            extra_instructions=req_data.get("extra_instructions", ""),
+            tts_speed=float(req_data.get("tts_speed", 1.0)),
+            gap_seconds=float(req_data.get("gap_seconds", 0.28)),
+            chunk_chars=int(req_data.get("chunk_chars", 6000)),
+            keep_workdir=bool(req_data.get("keep_workdir", True)),
+            show_subtitles=bool(req_data.get("show_subtitles", False)),
+            show_slides=bool(req_data.get("show_slides", False)),
+            enable_review=bool(req_data.get("enable_review", False)),
+        )
+
+        review_dict = data.get("review_data", {})
+        review_data = ReviewData(
+            script_title=review_dict.get("script_title", ""),
+            script_outline=list(review_dict.get("script_outline", [])),
+            script_turns=list(review_dict.get("script_turns", [])),
+            audio_clips=list(review_dict.get("audio_clips", [])),
+            slides=list(review_dict.get("slides", [])),
+            hosts=list(review_dict.get("hosts", [])),
+        )
+
+        job = cls(
+            id=data["id"],
+            request=request,
+            status=data.get("status", "queued"),
+            step=data.get("step", ""),
+            progress=float(data.get("progress", 0.0)),
+            message=data.get("message", ""),
+            error=data.get("error"),
+            created_at=float(data.get("created_at", time.time())),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            logs=list(data.get("logs", [])),
+            result=data.get("result"),
+            workdir=data.get("workdir", ""),
+            review_data=review_data,
+            current_phase=data.get("current_phase", "source"),
+        )
+        job._pipeline_state = dict(data.get("pipeline_state", {}))
+        return job
+
 
 class JobStore:
-    def __init__(self, max_workers: int = 2):
+    JOBS_FILE = "jobs.json"
+    MAX_PERSISTED_JOBS = 100
+
+    def __init__(self, max_workers: int = 2, persist_dir: Path | None = None):
         self._jobs: dict[str, Job] = {}
         self._order: list[str] = []
         self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers,
                                              thread_name_prefix="podcaster")
+        self._persist_dir = persist_dir or config_mod.DATA_DIR
+        self._jobs_file = self._persist_dir / self.JOBS_FILE
+        self._load_persisted_jobs()
+
+    def _load_persisted_jobs(self) -> None:
+        """Load jobs from disk on startup."""
+        if not self._jobs_file.exists():
+            return
+        try:
+            data = json.loads(self._jobs_file.read_text(encoding="utf-8"))
+            jobs_data = data.get("jobs", [])
+            for job_data in jobs_data:
+                try:
+                    job = Job.from_persist_dict(job_data)
+                    # Mark running/review jobs as interrupted
+                    if job.status in INTERRUPTED_STATUSES:
+                        job.status = "interrupted"
+                        job.log("warn", "Job was interrupted by app shutdown")
+                    job._persist_callback = self._persist
+                    self._jobs[job.id] = job
+                    self._order.append(job.id)
+                except Exception as e:
+                    logger.warning(f"Failed to restore job {job_data.get('id')}: {e}")
+            logger.info(f"Loaded {len(self._jobs)} persisted jobs")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Failed to load persisted jobs: {e}")
+
+    def _persist(self) -> None:
+        """Persist all jobs to disk."""
+        with self._persist_lock:
+            try:
+                self._persist_dir.mkdir(parents=True, exist_ok=True)
+                with self._lock:
+                    jobs_data = []
+                    for job_id in self._order[-self.MAX_PERSISTED_JOBS:]:
+                        if job_id in self._jobs:
+                            jobs_data.append(self._jobs[job_id].to_persist_dict())
+                data = {
+                    "version": 1,
+                    "updated_at": time.time(),
+                    "jobs": jobs_data,
+                }
+                temp_file = self._jobs_file.with_suffix(".tmp")
+                temp_file.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+                temp_file.replace(self._jobs_file)
+            except OSError as e:
+                logger.error(f"Failed to persist jobs: {e}")
 
     def create(self, request: PodcastRequest) -> Job:
         job_id = uuid.uuid4().hex[:12]
         workdir = config_mod.DATA_DIR / "jobs" / job_id
         job = Job(id=job_id, request=request, workdir=str(workdir))
+        job._persist_callback = self._persist
         with self._lock:
             self._jobs[job_id] = job
             self._order.append(job_id)
-            if len(self._order) > 60:
+            if len(self._order) > self.MAX_PERSISTED_JOBS:
                 oldest = self._order.pop(0)
                 self._jobs.pop(oldest, None)
+        self._persist()
         self._executor.submit(self._run, job)
         return job
 
-    def _run(self, job: Job) -> None:
+    def _run(self, job: Job, resume_from: str | None = None) -> None:
         job.started_at = time.time()
         job.set_status("running")
-        job.log("info", "Job started")
+        job.log("info", "Job started" if not resume_from else f"Job resumed from {resume_from}")
         try:
             result = run_pipeline(
                 job.request,
@@ -238,8 +440,10 @@ class JobStore:
                 log=job.log,
                 should_cancel=lambda: job.cancelled,
                 job=job,
+                resume_from=resume_from,
             )
             job.result = result
+            job.set_phase("done")
             job.set_status("done")
             job.set_step("Finished", 1.0)
             job.log("info", f"Done — output at {result['export_path']}")
@@ -255,6 +459,78 @@ class JobStore:
             job.log("error", f"{type(exc).__name__}: {exc}")
             for line in traceback.format_exc().splitlines()[-8:]:
                 job.log("error", line)
+
+    def resume(self, job_id: str) -> Job | None:
+        """Resume an interrupted job from its last phase."""
+        job = self.get(job_id)
+        if not job:
+            return None
+        if job.status not in RESUMABLE_STATUSES:
+            return None
+
+        # Reset runtime state for resumed execution
+        job._cancel = threading.Event()
+        job._resume = threading.Event()
+        job._events = queue.Queue()
+        job.error = None
+
+        resume_from = job.current_phase
+        job.log("info", f"Resuming job from phase: {resume_from}")
+        self._executor.submit(self._run, job, resume_from)
+        return job
+
+    def delete(self, job_id: str, keep_exports: bool = True) -> dict[str, Any]:
+        """Delete a job and its temporary files, optionally keeping final exports."""
+        job = self.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Job not found"}
+
+        if job.status in ("running", "queued") + REVIEW_STATUSES:
+            return {"ok": False, "error": "Cannot delete a running job"}
+
+        deleted_files: list[str] = []
+        kept_exports: list[str] = []
+
+        # Identify final exports to keep
+        exports_to_keep: set[Path] = set()
+        if keep_exports and job.result:
+            for key in ("export_path", "audio_path", "video_path"):
+                path_str = job.result.get(key)
+                if path_str:
+                    export_path = Path(path_str)
+                    if export_path.exists():
+                        exports_to_keep.add(export_path.resolve())
+                        kept_exports.append(str(export_path))
+
+        # Delete workdir (temp files)
+        workdir = Path(job.workdir)
+        if workdir.exists():
+            # Don't delete exports that happen to be in workdir (unlikely but safe)
+            for item in workdir.rglob("*"):
+                if item.is_file() and item.resolve() not in exports_to_keep:
+                    try:
+                        item.unlink()
+                        deleted_files.append(str(item))
+                    except OSError:
+                        pass
+            # Remove empty directories
+            try:
+                shutil.rmtree(workdir, ignore_errors=True)
+            except OSError:
+                pass
+
+        # Remove from store
+        with self._lock:
+            self._jobs.pop(job_id, None)
+            if job_id in self._order:
+                self._order.remove(job_id)
+        self._persist()
+
+        return {
+            "ok": True,
+            "deleted_files": deleted_files,
+            "kept_exports": kept_exports,
+        }
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
